@@ -2,6 +2,8 @@
 
 # model alias → "HF_MODEL_ID [trust_remote_code]"
 declare -A MODELS=(
+    # Local testing
+    ["gemma3-270m"]="google/gemma-3-270m-it"
     # Gemma 4 — full precision (small enough to run as-is)
     ["gemma4-e2b"]="google/gemma-4-E2B-it"
     ["gemma4-e4b"]="google/gemma-4-E4B-it"
