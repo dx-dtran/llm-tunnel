@@ -11,7 +11,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
 
-MODEL_ID = os.environ.get("MODEL_ID", "google/gemma-3-4b-it")
+MODEL_ID = os.environ.get("MODEL_ID", "google/gemma-3-270m-it")
 
 app = FastAPI()
 model: AutoModelForCausalLM = None
@@ -21,8 +21,14 @@ tokenizer: AutoTokenizer = None
 @app.on_event("startup")
 async def load_model():
     global model, tokenizer
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif torch.backends.mps.is_available():
+        device = "mps"
+    else:
+        device = "cpu"
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
-    model = AutoModelForCausalLM.from_pretrained(MODEL_ID, torch_dtype=torch.bfloat16, device_map="cuda")
+    model = AutoModelForCausalLM.from_pretrained(MODEL_ID, torch_dtype=torch.bfloat16, device_map=device)
     model.eval()
 
 
@@ -106,9 +112,13 @@ async def list_models():
 @app.post("/v1/messages")
 async def messages(req: MessagesRequest):
     prompt = build_prompt(req)
-    input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(model.device)
+    encoded = tokenizer(prompt, return_tensors="pt")
+    input_ids = encoded.input_ids.to(model.device)
+    attention_mask = encoded.attention_mask.to(model.device)
     input_tokens = input_ids.shape[-1]
     kwargs = gen_kwargs(req)
+    kwargs["attention_mask"] = attention_mask
+    kwargs["pad_token_id"] = tokenizer.eos_token_id
 
     if req.stream:
         return StreamingResponse(
@@ -173,8 +183,20 @@ async def _stream(input_ids, input_tokens: int, kwargs: dict, model_name: str):
     )
     thread.start()
 
+    loop = asyncio.get_running_loop()
+    it = iter(streamer)
+
+    def next_chunk():
+        try:
+            return next(it)
+        except StopIteration:
+            return None
+
     output_tokens = 0
-    for chunk in streamer:
+    while True:
+        chunk = await loop.run_in_executor(None, next_chunk)
+        if chunk is None:
+            break
         if not chunk:
             continue
         output_tokens += 1
@@ -183,7 +205,6 @@ async def _stream(input_ids, input_tokens: int, kwargs: dict, model_name: str):
             "index": 0,
             "delta": {"type": "text_delta", "text": chunk},
         })
-        await asyncio.sleep(0)  # yield control to the event loop between tokens
 
     thread.join()
 
