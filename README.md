@@ -15,7 +15,7 @@ pip install -r requirements.txt
 ```
 
 ```bash
-uvicorn server:app --host 127.0.0.1 --port 8080 --no-access-log
+uvicorn server:app --host 127.0.0.1 --port 18080 --no-access-log
 ```
 
 Default model: `google/gemma-3-270m-it`. Downloaded automatically from HuggingFace on first run.
@@ -23,7 +23,7 @@ Default model: `google/gemma-3-270m-it`. Downloaded automatically from HuggingFa
 Test it:
 
 ```bash
-curl -s http://localhost:8080/v1/chat/completions \
+curl -s http://localhost:18080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"messages": [{"role": "user", "content": "Write a short story."}], "max_tokens": 256}' \
   | python3 -m json.tool
@@ -83,16 +83,16 @@ Models are downloaded automatically on first run and cached for all subsequent r
 In a separate terminal on your local machine:
 
 ```bash
-ssh -L 8080:localhost:8080 -p <PORT> root@<IP>
+ssh -L 18080:localhost:18080 -p <PORT> root@<IP>
 ```
 
-This forwards `localhost:8080` on your machine to the server running on the Vast.ai instance. Keep this terminal open while you use the server.
+This forwards `localhost:18080` on your machine to the server running on the Vast.ai instance. Keep this terminal open while you use the server.
 
 ---
 
 ## LibreChat setup
 
-LibreChat runs locally in Docker and connects to the server through the SSH tunnel. From its perspective the server is always at `host.docker.internal:8080` regardless of whether it's running locally or on Vast.ai — the tunnel makes them identical.
+LibreChat runs locally in Docker and connects to the server through the SSH tunnel. From its perspective the server is always at `host.docker.internal:18080` regardless of whether it's running locally or on Vast.ai — the tunnel makes them identical.
 
 ### 1. Get LibreChat
 
@@ -112,7 +112,7 @@ endpoints:
   custom:
     - name: "Local Model"
       apiKey: "dummy"
-      baseURL: "http://host.docker.internal:8080/v1"
+      baseURL: "http://host.docker.internal:18080/v1"
       models:
         default: ["google/gemma-3-4b-it"]
         fetch: false
@@ -144,19 +144,19 @@ Open [http://localhost:3080](http://localhost:3080), create an account, and the 
 
 ### Switching between local and Vast.ai
 
-No changes needed in LibreChat or its config. Just make sure the SSH tunnel is running when using Vast.ai. When testing locally, start `server.py` on your machine and the same `host.docker.internal:8080` URL works automatically.
+No changes needed in LibreChat or its config. Just make sure the SSH tunnel is running when using Vast.ai. When testing locally, start `server.py` on your machine and the same `host.docker.internal:18080` URL works automatically.
 
 ---
 
 ## Other clients
 
-**Chatbox** — Settings → AI Provider → OpenAI API → API Host: `http://localhost:8080`, API Key: `dummy`
+**Chatbox** — Settings → AI Provider → OpenAI API → API Host: `http://localhost:18080`, API Key: `dummy`
 
 **Claude Code / aider (Anthropic SDK)**:
 
 ```bash
 export ANTHROPIC_API_KEY=dummy
-export ANTHROPIC_BASE_URL=http://localhost:8080
+export ANTHROPIC_BASE_URL=http://localhost:18080
 ```
 
 ---

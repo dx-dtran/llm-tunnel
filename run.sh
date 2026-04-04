@@ -42,4 +42,4 @@ export MODEL_ID
 export TRUST_REMOTE_CODE="$TRUST"
 
 echo "Model: $MODEL_ID"
-uvicorn server:app --host 127.0.0.1 --port 8080 --no-access-log
+uvicorn server:app --host 127.0.0.1 --port 18080 --no-access-log
