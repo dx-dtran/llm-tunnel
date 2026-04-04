@@ -1,13 +1,16 @@
 # LLM Tunnel
 
-A minimal LLM inference server (`server.py`) that exposes both an Anthropic-compatible (`/v1/messages`) and OpenAI-compatible (`/v1/chat/completions`) API. Designed to run on a remote GPU host (e.g. Vast.ai) and stream tokens privately to your local machine via an SSH tunnel.
+A minimal LLM inference server that exposes both Anthropic and OpenAI compatible APIs. Designed to run on a remote GPU host (e.g. Vast.ai) and stream tokens privately to your local machine via an SSH tunnel.
 
-No conversation content is ever logged — request bodies are never captured by FastAPI, and `--no-access-log` suppresses uvicorn's HTTP request logs entirely.
+No conversation content is ever logged. Request bodies are never captured by FastAPI, and `--no-access-log` suppresses uvicorn's HTTP request logs entirely.
 
 ## Quick start (local)
 
 ```bash
 pip install -r requirements.txt
+```
+
+```bash
 uvicorn server:app --host 127.0.0.1 --port 8080 --no-access-log
 ```
 
@@ -18,7 +21,7 @@ Test it:
 ```bash
 curl -s http://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"messages": [{"role": "user", "content": "Say hello."}], "max_tokens": 64}' \
+  -d '{"messages": [{"role": "user", "content": "Write a short story."}], "max_tokens": 256}' \
   | python3 -m json.tool
 ```
 
