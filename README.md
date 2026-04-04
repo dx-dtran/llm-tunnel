@@ -35,7 +35,7 @@ curl -s http://localhost:8080/v1/chat/completions \
 
 ### 1. Rent a GPU instance
 
-On the [Vast.ai console](https://vast.ai), rent any CUDA instance. Note the **SSH port** and **IP address** from the instance dashboard.
+On the Vast.ai console, rent any CUDA instance. Note the **SSH port** and **IP address** from the instance dashboard.
 
 ### 2. SSH into the instance
 
@@ -43,18 +43,42 @@ On the [Vast.ai console](https://vast.ai), rent any CUDA instance. Note the **SS
 ssh -p <PORT> root@<IP>
 ```
 
-### 3. Install dependencies and start the server
+### 3. Install dependencies
 
 ```bash
 pip install -r requirements.txt
-MODEL_ID=google/gemma-3-4b-it uvicorn server:app --host 127.0.0.1 --port 8080 --no-access-log
+```
+
+```bash
+chmod +x run.sh
+```
+
+### 4. Start the server
+
+```bash
+./run.sh gemma4-31b-4bit
 ```
 
 The server binds to `127.0.0.1` only — it is not reachable from the public internet, only via the SSH tunnel.
 
-Swap `MODEL_ID` for any HuggingFace model ID. The model is downloaded automatically on first run.
+Models are downloaded automatically on first run and cached for all subsequent runs. Run `./run.sh` with no arguments to see all available models.
 
-### 4. Open the SSH tunnel (on your local machine)
+**Available models:**
+
+| Alias | Model | Notes |
+|-------|-------|-------|
+| `gemma4-e2b` | google/gemma-4-E2B-it | 2B multimodal |
+| `gemma4-e4b` | google/gemma-4-E4B-it | 4B multimodal |
+| `gemma4-26b` | google/gemma-4-26B-A4B-it | 26B MoE (4B active) |
+| `gemma4-26b-4bit` | cyankiwi/gemma-4-26B-A4B-it-AWQ-4bit | AWQ 4-bit |
+| `gemma4-31b` | google/gemma-4-31B-it | 31B dense |
+| `gemma4-31b-4bit` | cyankiwi/gemma-4-31B-it-AWQ-4bit | AWQ 4-bit |
+| `gpt-oss-20b` | openai/gpt-oss-20b | |
+| `gpt-oss-20b-4bit` | unsloth/gpt-oss-20b-bnb-4bit | BNB 4-bit |
+| `gpt-oss-120b` | openai/gpt-oss-120b | |
+| `gpt-oss-120b-4bit` | twhitworth/gpt-oss-120b-awq-w4a16 | AWQ 4-bit |
+
+### 5. Open the SSH tunnel (on your local machine)
 
 In a separate terminal on your local machine:
 
