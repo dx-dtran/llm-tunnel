@@ -14,7 +14,7 @@ import transformers
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
-from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer, BitsAndBytesConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer, BitsAndBytesConfig, AutoConfig
 
 transformers.logging.set_verbosity_error()
 
@@ -39,8 +39,11 @@ input_device: torch.device = None
 async def load_model():
     global model, tokenizer, input_device
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
-    quantization_config = BitsAndBytesConfig(load_in_4bit=True) if LOAD_IN_4BIT else None
-    model = AutoModelForCausalLM.from_pretrained(MODEL_ID, dtype="auto", device_map="auto", quantization_config=quantization_config)
+    cfg = AutoConfig.from_pretrained(MODEL_ID)
+    already_quantized = getattr(cfg, "quantization_config", None) is not None
+    quantization_config = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16) if LOAD_IN_4BIT and not already_quantized else None
+    dtype = torch.bfloat16 if LOAD_IN_4BIT and not already_quantized else "auto"
+    model = AutoModelForCausalLM.from_pretrained(MODEL_ID, dtype=dtype, device_map="auto", quantization_config=quantization_config)
     model.eval()
     input_device = next(model.parameters()).device
 
