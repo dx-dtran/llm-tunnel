@@ -43,8 +43,9 @@ async def load_model():
     already_quantized = getattr(cfg, "quantization_config", None) is not None
     quantization_config = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16) if LOAD_IN_4BIT and not already_quantized else None
     dtype = torch.bfloat16 if LOAD_IN_4BIT and not already_quantized else "auto"
-    model = AutoModelForCausalLM.from_pretrained(MODEL_ID, dtype=dtype, device_map="auto", quantization_config=quantization_config)
+    model = AutoModelForCausalLM.from_pretrained(MODEL_ID, dtype=dtype, device_map="auto", quantization_config=quantization_config, attn_implementation="sdpa")
     model.eval()
+    model = torch.compile(model)
     input_device = next(model.parameters()).device
 
 
@@ -137,7 +138,11 @@ async def _iter_streamer(input_ids, kwargs: dict):
     streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
     kwargs = {**kwargs, "streamer": streamer}
 
-    thread = threading.Thread(target=lambda: model.generate(input_ids, **kwargs), daemon=True)
+    def _generate():
+        with torch.inference_mode():
+            model.generate(input_ids, **kwargs)
+
+    thread = threading.Thread(target=_generate, daemon=True)
     thread.start()
 
     loop = asyncio.get_running_loop()
