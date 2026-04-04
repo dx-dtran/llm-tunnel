@@ -38,7 +38,7 @@ input_device: torch.device = None
 async def load_model():
     global model, tokenizer, input_device
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
-    model = AutoModelForCausalLM.from_pretrained(MODEL_ID, torch_dtype="auto", device_map="auto")
+    model = AutoModelForCausalLM.from_pretrained(MODEL_ID, dtype="auto", device_map="auto")
     model.eval()
     input_device = next(model.parameters()).device
 
@@ -83,9 +83,19 @@ def _extract_text(content: str | list) -> str:
     )
 
 
+def _merge_consecutive(chat: list[dict]) -> list[dict]:
+    merged = []
+    for msg in chat:
+        if merged and merged[-1]["role"] == msg["role"]:
+            merged[-1]["content"] += "\n" + msg["content"]
+        else:
+            merged.append(dict(msg))
+    return merged
+
+
 def _build_prompt(chat: list[dict]) -> str:
     if tokenizer.chat_template:
-        return tokenizer.apply_chat_template(chat, tokenize=False, add_generation_prompt=True)
+        return tokenizer.apply_chat_template(_merge_consecutive(chat), tokenize=False, add_generation_prompt=True)
     parts = []
     for m in chat:
         prefix = "System" if m["role"] == "system" else m["role"].capitalize()
