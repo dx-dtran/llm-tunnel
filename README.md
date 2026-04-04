@@ -1,6 +1,6 @@
 # LLM Tunnel
 
-Chat with open-weight LLMs on your own remote GPUs.
+Privately chat with open-weight LLMs on remote GPUs.
 
 This is a small LLM inference server that exposes both Anthropic and OpenAI compatible APIs. It's designed to run on a remote GPU host (e.g. Vast.ai) and stream tokens privately to your local machine via an SSH tunnel.
 
