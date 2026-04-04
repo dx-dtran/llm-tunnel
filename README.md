@@ -70,13 +70,13 @@ Models are downloaded automatically on first run and cached for all subsequent r
 | `gemma4-e2b` | google/gemma-4-E2B-it | 2B multimodal |
 | `gemma4-e4b` | google/gemma-4-E4B-it | 4B multimodal |
 | `gemma4-26b` | google/gemma-4-26B-A4B-it | 26B MoE (4B active) |
-| `gemma4-26b-4bit` | cyankiwi/gemma-4-26B-A4B-it-AWQ-4bit | AWQ 4-bit |
+| `gemma4-26b-4bit` | google/gemma-4-26B-A4B-it | BNB 4-bit |
 | `gemma4-31b` | google/gemma-4-31B-it | 31B dense |
-| `gemma4-31b-4bit` | cyankiwi/gemma-4-31B-it-AWQ-4bit | AWQ 4-bit |
+| `gemma4-31b-4bit` | google/gemma-4-31B-it | BNB 4-bit |
 | `gpt-oss-20b` | openai/gpt-oss-20b | |
-| `gpt-oss-20b-4bit` | unsloth/gpt-oss-20b-bnb-4bit | BNB 4-bit |
+| `gpt-oss-20b-4bit` | openai/gpt-oss-20b | BNB 4-bit |
 | `gpt-oss-120b` | openai/gpt-oss-120b | |
-| `gpt-oss-120b-4bit` | twhitworth/gpt-oss-120b-awq-w4a16 | AWQ 4-bit |
+| `gpt-oss-120b-4bit` | openai/gpt-oss-120b | BNB 4-bit |
 
 ### 5. Open the SSH tunnel (on your local machine)
 
@@ -169,7 +169,7 @@ Set `MODEL_ID` to any HuggingFace causal LM. Models with a `chat_template` in th
 
 Everything lives in `server.py`:
 
-- **`load_model`** — loads tokenizer + model at startup into bfloat16; auto-selects CUDA, MPS (Apple Silicon), or CPU
+- **`load_model`** — loads tokenizer + model at startup; auto-selects device and dtype, optional BNB 4-bit quantization via `LOAD_IN_4BIT=1`
 - **`_build_prompt`** — applies the model's chat template (or plain fallback) to the message list
 - **`POST /v1/messages`** — Anthropic-compatible endpoint, streaming and non-streaming
 - **`POST /v1/chat/completions`** — OpenAI-compatible endpoint, streaming and non-streaming

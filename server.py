@@ -14,7 +14,7 @@ import transformers
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
-from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
+from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer, BitsAndBytesConfig
 
 transformers.logging.set_verbosity_error()
 
@@ -22,6 +22,7 @@ import logging
 logging.getLogger("uvicorn.access").disabled = True
 
 MODEL_ID = os.environ.get("MODEL_ID", "google/gemma-3-270m-it")
+LOAD_IN_4BIT = os.environ.get("LOAD_IN_4BIT", "0") == "1"
 
 app = FastAPI()
 
@@ -38,7 +39,8 @@ input_device: torch.device = None
 async def load_model():
     global model, tokenizer, input_device
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
-    model = AutoModelForCausalLM.from_pretrained(MODEL_ID, dtype="auto", device_map="auto")
+    quantization_config = BitsAndBytesConfig(load_in_4bit=True) if LOAD_IN_4BIT else None
+    model = AutoModelForCausalLM.from_pretrained(MODEL_ID, dtype="auto", device_map="auto", quantization_config=quantization_config)
     model.eval()
     input_device = next(model.parameters()).device
 
