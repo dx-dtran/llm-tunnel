@@ -1,6 +1,10 @@
 # LLM Tunnel
 
-A minimal LLM inference server that exposes both Anthropic and OpenAI compatible APIs. Designed to run on a remote GPU host (e.g. Vast.ai) and stream tokens privately to your local machine via an SSH tunnel.
+Chat with open-weight LLMs on your own remote GPUs.
+
+This is a small LLM inference server that exposes both Anthropic and OpenAI compatible APIs. It's designed to run on a remote GPU host (e.g. Vast.ai) and stream tokens privately to your local machine via an SSH tunnel.
+
+You can chat with your remote LLM via a GUI that supports custom servers such as LibreChat.
 
 No conversation content is ever logged. Request bodies are never captured by FastAPI, and `--no-access-log` suppresses uvicorn's HTTP request logs entirely.
 
