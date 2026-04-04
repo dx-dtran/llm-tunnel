@@ -21,15 +21,9 @@ tokenizer: AutoTokenizer = None
 @app.on_event("startup")
 async def load_model():
     global model, tokenizer
-    print(f"Loading {MODEL_ID}...")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_ID,
-        torch_dtype=torch.bfloat16,
-        device_map="cuda",
-    )
+    model = AutoModelForCausalLM.from_pretrained(MODEL_ID, torch_dtype=torch.bfloat16, device_map="cuda")
     model.eval()
-    print("Ready.")
 
 
 # ---------- request / response types ----------

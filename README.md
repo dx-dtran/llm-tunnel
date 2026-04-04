@@ -2,7 +2,7 @@
 
 A minimal Anthropic-API-compatible LLM inference server (`server.py`) meant to run on a remote GPU host (e.g. Vast.ai).
 
-It streams tokens privately to your local machine. No logs persisted onto the remote machine whatsoever.
+It streams tokens privately to your local machine. No conversation content is ever logged — request bodies are never captured by FastAPI, and `--no-access-log` suppresses uvicorn's HTTP request logs entirely.
 
 It exposes `/v1/messages` with streaming SSE so that local tools using the Anthropic SDK (Claude Code, aider, etc.) can point at it via an SSH tunnel.
 
@@ -10,7 +10,7 @@ It exposes `/v1/messages` with streaming SSE so that local tools using the Anthr
 
 ```bash
 pip install -r requirements.txt
-MODEL_ID=google/gemma-3-4b-it uvicorn server:app --host 127.0.0.1 --port 8080
+MODEL_ID=google/gemma-3-4b-it uvicorn server:app --host 127.0.0.1 --port 8080 --no-access-log
 ```
 
 The server binds to localhost only — access is exclusively through the SSH tunnel.
@@ -31,7 +31,7 @@ export ANTHROPIC_BASE_URL=http://localhost:8080
 
 Then use Claude Code, aider, or any Anthropic SDK client normally — they'll hit the local model.
 
-## Swapping models
+## Models
 
 Set `MODEL_ID` to any HuggingFace causal LM. Models with a `chat_template` in their tokenizer config work best (Gemma, Llama, Qwen, Mistral, etc.). Base models without a chat template fall back to a plain `Role: content` prompt format.
 
