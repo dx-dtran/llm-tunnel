@@ -31,20 +31,16 @@ async def _suppress_traceback(_: Request, exc: Exception) -> JSONResponse:
     return JSONResponse(status_code=500, content={"error": {"message": "Internal server error", "type": type(exc).__name__}})
 model: AutoModelForCausalLM = None
 tokenizer: AutoTokenizer = None
+input_device: torch.device = None
 
 
 @app.on_event("startup")
 async def load_model():
-    global model, tokenizer
-    if torch.cuda.is_available():
-        device = "cuda"
-    elif torch.backends.mps.is_available():
-        device = "mps"
-    else:
-        device = "cpu"
+    global model, tokenizer, input_device
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
-    model = AutoModelForCausalLM.from_pretrained(MODEL_ID, torch_dtype="auto", device_map=device)
+    model = AutoModelForCausalLM.from_pretrained(MODEL_ID, torch_dtype="auto", device_map="auto")
     model.eval()
+    input_device = next(model.parameters()).device
 
 
 # ---------- request / response types ----------
@@ -101,8 +97,8 @@ def _build_prompt(chat: list[dict]) -> str:
 def _prepare_inputs(chat: list[dict]):
     prompt = _build_prompt(chat)
     encoded = tokenizer(prompt, return_tensors="pt")
-    input_ids = encoded.input_ids.to(model.device)
-    attention_mask = encoded.attention_mask.to(model.device)
+    input_ids = encoded.input_ids.to(input_device)
+    attention_mask = encoded.attention_mask.to(input_device)
     return input_ids, attention_mask
 
 
