@@ -41,5 +41,7 @@ TRUST=$(echo "$entry" | grep -q "trust_remote_code" && echo "1" || echo "0")
 export MODEL_ID
 export TRUST_REMOTE_CODE="$TRUST"
 
+fuser -k 8080/tcp 2>/dev/null; sleep 1
+
 echo "Model: $MODEL_ID"
-uvicorn server:app --host 127.0.0.1 --port 18080 --no-access-log
+uvicorn server:app --host 127.0.0.1 --port 8080 --no-access-log
