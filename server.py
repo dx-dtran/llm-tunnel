@@ -5,15 +5,30 @@ import time
 import asyncio
 import threading
 
+# Disable Hugging Face telemetry before importing transformers/huggingface_hub
+os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
+
 import torch
-from fastapi import FastAPI
-from fastapi.responses import StreamingResponse
+import transformers
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
+
+transformers.logging.set_verbosity_error()
+
+import logging
+logging.getLogger("uvicorn.access").disabled = True
 
 MODEL_ID = os.environ.get("MODEL_ID", "google/gemma-3-270m-it")
 
 app = FastAPI()
+
+
+@app.exception_handler(Exception)
+async def _suppress_traceback(_: Request, exc: Exception) -> JSONResponse:
+    return JSONResponse(status_code=500, content={"error": {"message": "Internal server error", "type": type(exc).__name__}})
 model: AutoModelForCausalLM = None
 tokenizer: AutoTokenizer = None
 
@@ -28,7 +43,7 @@ async def load_model():
     else:
         device = "cpu"
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
-    model = AutoModelForCausalLM.from_pretrained(MODEL_ID, torch_dtype=torch.bfloat16, device_map=device)
+    model = AutoModelForCausalLM.from_pretrained(MODEL_ID, torch_dtype="auto", device_map=device)
     model.eval()
 
 
