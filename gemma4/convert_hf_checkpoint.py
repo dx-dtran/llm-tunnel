@@ -89,13 +89,17 @@ def convert_hf_checkpoint(
             state_dict = load_safetensors_file(str(file), device="cpu")
             merged_result.update(state_dict)
 
-    # Detect prefix: multimodal models use "language_model.model." prefix
-    sample_key = next(iter(merged_result.keys()))
-    if sample_key.startswith("language_model."):
-        prefix = "language_model."
+    # Detect prefix: multimodal models wrap language model weights
+    # Find the embed_tokens key to determine the actual prefix
+    prefix = ""
+    for key in merged_result:
+        if "embed_tokens" in key:
+            # e.g. "model.language_model.model.embed_tokens.weight" -> prefix = "model.language_model."
+            idx = key.index("model.embed_tokens")
+            prefix = key[:idx]
+            break
+    if prefix:
         print(f"Detected multimodal model, stripping '{prefix}' prefix")
-    else:
-        prefix = ""
 
     # Weight name mapping (HF -> gpt-fast)
     weight_map = {
