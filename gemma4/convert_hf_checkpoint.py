@@ -89,22 +89,20 @@ def convert_hf_checkpoint(
             state_dict = load_safetensors_file(str(file), device="cpu")
             merged_result.update(state_dict)
 
-    # Detect prefix: multimodal models wrap language model weights
-    # Find the embed_tokens key to determine the actual prefix
+    # Detect prefix: everything before "embed_tokens.weight" in the language model
+    # e.g. "model.embed_tokens.weight" -> prefix = "model."
+    # e.g. "model.language_model.embed_tokens.weight" -> prefix = "model.language_model."
     prefix = ""
     for key in merged_result:
-        if "embed_tokens" in key:
-            # e.g. "model.language_model.model.embed_tokens.weight" -> prefix = "model.language_model."
-            idx = key.index("model.embed_tokens")
-            prefix = key[:idx]
+        if key.endswith("embed_tokens.weight") and "vision" not in key:
+            prefix = key[: -len("embed_tokens.weight")]
             break
-    if prefix:
-        print(f"Detected multimodal model, stripping '{prefix}' prefix")
+    print(f"Using prefix: '{prefix}'")
 
     # Weight name mapping (HF -> gpt-fast)
     weight_map = {
-        f"{prefix}model.embed_tokens.weight": "tok_embeddings.weight",
-        f"{prefix}model.norm.weight": "norm.weight",
+        f"{prefix}embed_tokens.weight": "tok_embeddings.weight",
+        f"{prefix}norm.weight": "norm.weight",
         # Per-layer mappings handled separately
     }
 
@@ -143,7 +141,7 @@ def convert_hf_checkpoint(
 
         # Handle per-layer weights
         layer_match = re.search(
-            rf"{re.escape(prefix)}model\.layers\.(\d+)\.(.*)", key
+            rf"^{re.escape(prefix)}layers\.(\d+)\.(.*)", key
         )
         if layer_match:
             layer_idx = int(layer_match.group(1))
