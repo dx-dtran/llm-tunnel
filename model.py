@@ -489,7 +489,7 @@ def generate(model: Gemma4Model, prompt_tokens: list[int], max_new_tokens: int,
     # ── Decode loop ──
     cur_pos = seq_len
     while cur_pos < max_seq - 1:
-        tokens = next_token.unsqueeze(0).unsqueeze(0)  # [1, 1]
+        tokens = next_token.reshape(1, 1)  # [1, 1]
         pos = torch.tensor([cur_pos], device=device)
 
         logits = model(tokens, pos, kv_cache, None, None)
