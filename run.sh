@@ -46,6 +46,7 @@ fi
 
 MODEL_ID="${MODELS[$1]}"
 export MODEL_ID
+export HF_HUB_DISABLE_XET=1
 
 fuser -k 8080/tcp 2>/dev/null; sleep 1
 
