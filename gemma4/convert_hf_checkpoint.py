@@ -151,6 +151,12 @@ def convert_hf_checkpoint(
                 print(f"Skipping unknown weight: {key}")
                 continue
 
+            # q_norm, k_norm, layer_scalar only exist on global layers in the model
+            layer_type = _get_layer_type(layer_idx, config.n_layer)
+            global_only = {"self_attn.q_norm.weight", "self_attn.k_norm.weight", "layer_scalar"}
+            if layer_type == "sliding" and suffix in global_only:
+                continue
+
             new_suffix = layer_map[suffix]
             new_key = f"layers.{layer_idx}.{new_suffix}"
             final_result[new_key] = value
