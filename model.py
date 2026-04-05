@@ -574,14 +574,21 @@ class Int4Linear(nn.Module):
         self.in_features = in_features
         self.out_features = out_features
         self.groupsize = groupsize
+        self.inner_k_tiles = inner_k_tiles
+        # Register buffers with correct shapes so load_state_dict(assign=True) works
+        # (also works with meta device — buffers are meta tensors in that context)
+        packed_shape = (out_features // 8, in_features // (inner_k_tiles * 16), 32, inner_k_tiles // 2)
+        n_groups = in_features // groupsize
+        self.register_buffer("weight", torch.empty(packed_shape, dtype=torch.int32))
+        self.register_buffer("scales_and_zeros", torch.empty((n_groups, out_features, 2), dtype=torch.bfloat16))
 
     @classmethod
     def from_linear(cls, linear: nn.Linear, groupsize: int = 128,
                     inner_k_tiles: int = 8) -> "Int4Linear":
         layer = cls(linear.in_features, linear.out_features, groupsize, inner_k_tiles)
         w_pack, s_z = _quantize_int4(linear.weight.data, groupsize, inner_k_tiles)
-        layer.register_buffer("weight", w_pack)
-        layer.register_buffer("scales_and_zeros", s_z)
+        layer.weight = w_pack
+        layer.scales_and_zeros = s_z
         return layer
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -602,6 +609,17 @@ def quantize_model_int4(model: nn.Module, groupsize: int = 128) -> None:
                 setattr(model, name, Int4Linear.from_linear(child, groupsize))
         else:
             quantize_model_int4(child, groupsize)
+
+
+def _setup_int4_structure(model: nn.Module, groupsize: int = 128) -> None:
+    """Replace nn.Linear with empty Int4Linear shells (for loading cached quantized weights)."""
+    for name, child in list(model.named_children()):
+        if isinstance(child, nn.Linear):
+            N, K = child.out_features, child.in_features
+            if K % groupsize == 0 and K % 128 == 0 and N % 8 == 0:
+                setattr(model, name, Int4Linear(K, N, groupsize))
+        else:
+            _setup_int4_structure(child, groupsize)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -692,29 +710,39 @@ def load_model(model_id: str, quantize: bool = True, max_seq_len: int = 8192,
     print(f"  {config.num_hidden_layers} layers, hidden={config.hidden_size}, "
           f"heads={config.num_attention_heads}")
 
-    # Build model on CPU
-    print("Building model on CPU...")
-    model = Gemma4Model(config)
+    cache_path = os.path.join(model_path, "quantized_int4_g128.pt") if quantize else None
 
-    # Load weights
-    print("Loading weights...")
-    load_weights(model, model_path)
+    if quantize and os.path.exists(cache_path):
+        # Fast path: meta build + load cached quantized weights directly to GPU
+        print("Loading cached quantized model...")
+        with torch.device("meta"):
+            model = Gemma4Model(config)
+        _setup_int4_structure(model)
+        state_dict = torch.load(cache_path, map_location=device, weights_only=True)
+        model.load_state_dict(state_dict, assign=True)
+        model = model.to(dtype=torch.bfloat16)
+    else:
+        # Slow path: build on CPU, load bf16 weights, quantize
+        print("Building model on CPU...")
+        model = Gemma4Model(config)
 
-    # Quantize (int4 weight-only, native PyTorch)
-    if quantize:
-        print("Quantizing (int4 weight-only)...")
-        quantize_model_int4(model)
-        print("  Done")
+        print("Loading weights...")
+        load_weights(model, model_path)
 
-    # Move to device
-    print(f"Moving to {device}...")
-    model = model.to(device=device, dtype=torch.bfloat16)
+        if quantize:
+            print("Quantizing (int4 weight-only)...")
+            quantize_model_int4(model)
+            torch.cuda.empty_cache()
+            print("  Done")
+            print("Saving quantized cache for next run...")
+            torch.save(model.state_dict(), cache_path)
+
+        print(f"Moving to {device}...")
+        model = model.to(device=device, dtype=torch.bfloat16)
+
     model.eval()
-
-    # Setup RoPE tables
     model.setup_rope(max_seq_len, torch.device(device))
 
-    # Tokenizer
     tokenizer = AutoTokenizer.from_pretrained(model_path)
 
     print("Ready.")
