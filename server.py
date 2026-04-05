@@ -38,9 +38,6 @@ async def load_model():
     engine_kwargs = dict(
         model=MODEL_ID,
         dtype="bfloat16",
-        device="auto",
-        disable_log_requests=True,
-        disable_log_stats=True,
     )
     if LOAD_IN_4BIT:
         engine_kwargs["quantization"] = "bitsandbytes"
@@ -48,7 +45,7 @@ async def load_model():
 
     engine_args = AsyncEngineArgs(**engine_kwargs)
     engine = AsyncLLMEngine.from_engine_args(engine_args)
-    tokenizer = await engine.get_tokenizer()
+    tokenizer = engine.tokenizer
 
 
 # ---------- request / response types ----------
