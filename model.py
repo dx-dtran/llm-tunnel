@@ -38,7 +38,7 @@ class Gemma4Config:
     partial_rotary_factor: float = 0.25    # full attention only
     sliding_window: int = 1024
     max_position_embeddings: int = 262144
-    final_logit_softcapping: float = 30.0
+    final_logit_softcapping: Optional[float] = None
     attention_k_eq_v: bool = True
     layer_types: list = field(
         default_factory=lambda: (["sliding_attention"] * 5 + ["full_attention"]) * 10
@@ -66,7 +66,7 @@ class Gemma4Config:
             partial_rotary_factor=rp.get("full_attention", {}).get("partial_rotary_factor", 0.25),
             sliding_window=tc.get("sliding_window", 1024),
             max_position_embeddings=tc.get("max_position_embeddings", 262144),
-            final_logit_softcapping=tc.get("final_logit_softcapping", 30.0),
+            final_logit_softcapping=tc.get("final_logit_softcapping"),
             attention_k_eq_v=tc.get("attention_k_eq_v", True),
             layer_types=tc.get(
                 "layer_types",
@@ -99,14 +99,21 @@ class RMSNorm(nn.Module):
 
 # ─── Rotary position embeddings ────────────────────────────────────────
 
-def _precompute_rope(dim: int, max_len: int, theta: float, device: torch.device):
+def _precompute_rope(dim: int, max_len: int, theta: float, device: torch.device,
+                     freq_dim: Optional[int] = None):
     """Precompute cos/sin for RoPE.
 
     Returns cos, sin each of shape [max_len, dim] (full dim, not dim//2).
     Uses the rotate_half convention: pairs are (x[i], x[i + dim//2]).
+
+    freq_dim: denominator for frequency computation. Defaults to dim.
+              For proportional RoPE (partial rotary), pass the full head_dim
+              so frequencies are computed as arange(0, dim, 2) / freq_dim.
     """
+    if freq_dim is None:
+        freq_dim = dim
     half = dim // 2
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2, device=device, dtype=torch.float32) / dim))
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2, device=device, dtype=torch.float32) / freq_dim))
     t = torch.arange(max_len, device=device, dtype=torch.float32)
     angles = torch.outer(t, freqs)  # [max_len, half]
     # Double up for rotate_half convention: [cos, cos] so element-wise multiply works
@@ -225,9 +232,8 @@ class Gemma4Attention(nn.Module):
             k = k.repeat_interleave(self.kv_groups, dim=1)
             v = v.repeat_interleave(self.kv_groups, dim=1)
 
-        # Scaled dot-product attention
-        scale = 1.0 / math.sqrt(self.head_dim)
-        out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, scale=scale)
+        # Scaled dot-product attention (Gemma 4 uses scaling=1.0, NOT 1/sqrt(head_dim))
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, scale=1.0)
 
         out = out.transpose(1, 2).contiguous().view(B, L, -1)
         return self.o_proj(out)
@@ -315,9 +321,11 @@ class Gemma4Model(nn.Module):
         self._rope_sliding_sin = ss
 
         # Full attention: partial rotation on rotary_dim, theta=1M
+        # Frequencies use full global_head_dim as denominator (proportional RoPE)
         rotary_dim = int(self.config.partial_rotary_factor * self.config.global_head_dim)
         fc, fs = _precompute_rope(rotary_dim, max_len,
-                                  self.config.rope_theta_full, device)
+                                  self.config.rope_theta_full, device,
+                                  freq_dim=self.config.global_head_dim)
         self._rope_full_cos = fc
         self._rope_full_sin = fs
 
@@ -343,9 +351,10 @@ class Gemma4Model(nn.Module):
         # Tied output projection
         logits = F.linear(x, self.embed_tokens.weight)
 
-        # Logit softcapping
+        # Logit softcapping (only if configured)
         cap = self.config.final_logit_softcapping
-        logits = torch.tanh(logits / cap) * cap
+        if cap is not None:
+            logits = torch.tanh(logits / cap) * cap
 
         return logits
 
@@ -585,10 +594,32 @@ class Int4Linear(nn.Module):
         layer.scales_and_zeros = s_z
         return layer
 
+    def materialize(self):
+        """Dequantize once and cache as a bf16 buffer. Drops packed weights to save VRAM.
+
+        Useful when the model fits in VRAM at bf16 and you want to use plain
+        F.linear (e.g. for large-batch prefill). For single-token decode,
+        _weight_int4pack_mm is already optimal — materialize is not needed.
+        """
+        if not hasattr(self, "_weight_bf16"):
+            # Dequantize using the fused kernel: pass an identity to extract weights.
+            # scales_and_zeros: [K//groupsize, N, 2] bf16
+            # output of _weight_int4pack_mm with eye(K): [K, N] = weight.T → transpose → [N, K]
+            K, N = self.in_features, self.out_features
+            eye = torch.eye(K, dtype=torch.bfloat16, device=self.weight_packed.device)
+            w_bf16 = torch.ops.aten._weight_int4pack_mm(
+                eye, self.weight_packed, self.groupsize, self.scales_and_zeros
+            ).t().contiguous()  # [N, K]
+            self.register_buffer("_weight_bf16", w_bf16)
+            del self.weight_packed
+            del self.scales_and_zeros
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Fused kernel: dequantizes int4 weights and performs matmul in one pass.
-        # Never allocates a full-precision weight tensor.
         x = x.to(torch.bfloat16)
+        if hasattr(self, "_weight_bf16"):
+            # Post-materialize path: plain bf16 matmul (fastest for large batches)
+            return F.linear(x, self._weight_bf16)
+        # Default: fused dequant+matmul — never allocates a full-precision weight tensor
         origin_shape = x.shape
         x_2d = x.reshape(-1, self.in_features)
         out = torch.ops.aten._weight_int4pack_mm(
@@ -740,6 +771,14 @@ def load_model(model_id: str, quantize: bool = True, max_seq_len: int = 8192,
 
     model.eval()
     model.setup_rope(max_seq_len, torch.device(device))
+
+    # Optionally pre-dequantize int4 → bf16 for faster inference (4x more VRAM)
+    if quantize and os.environ.get("MATERIALIZE_WEIGHTS", "0") == "1":
+        print("Materializing dequantized weights (bf16)...")
+        for m in model.modules():
+            if isinstance(m, Int4Linear):
+                m.materialize()
+        torch.cuda.empty_cache()
 
     tokenizer = AutoTokenizer.from_pretrained(model_path)
 
