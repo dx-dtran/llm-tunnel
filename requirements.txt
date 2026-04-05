@@ -1,7 +1,4 @@
 fastapi
 uvicorn[standard]
-torch
-transformers
-accelerate
-autoawq
+vllm
 bitsandbytes

@@ -2,11 +2,11 @@
 
 Privately chat with open-weight LLMs on remote GPUs.
 
-This is a small LLM inference server that exposes both Anthropic and OpenAI compatible APIs. It's designed to run on a remote GPU host (e.g. Vast.ai) and stream tokens privately to your local machine via an SSH tunnel.
+This is a small LLM inference server powered by [vLLM](https://github.com/vllm-project/vllm) that exposes both Anthropic and OpenAI compatible APIs. It's designed to run on a remote GPU host (e.g. Vast.ai) and stream tokens privately to your local machine via an SSH tunnel.
 
 You can chat with your remote LLM via a GUI that supports custom servers such as LibreChat.
 
-No conversation content is ever logged. Request bodies are never captured by FastAPI, and `--no-access-log` suppresses uvicorn's HTTP request logs entirely.
+No conversation content is ever logged. vLLM request/stats logging is disabled, and `--no-access-log` suppresses uvicorn's HTTP request logs entirely.
 
 ## Quick start (local)
 
@@ -65,18 +65,20 @@ Models are downloaded automatically on first run and cached for all subsequent r
 
 **Available models:**
 
-| Alias | Model | Notes |
-|-------|-------|-------|
-| `gemma4-e2b` | google/gemma-4-E2B-it | 2B multimodal |
-| `gemma4-e4b` | google/gemma-4-E4B-it | 4B multimodal |
-| `gemma4-26b` | google/gemma-4-26B-A4B-it | 26B MoE (4B active) |
-| `gemma4-26b-4bit` | google/gemma-4-26B-A4B-it | BNB 4-bit |
-| `gemma4-31b` | google/gemma-4-31B-it | 31B dense |
-| `gemma4-31b-4bit` | google/gemma-4-31B-it | BNB 4-bit |
-| `gpt-oss-20b` | openai/gpt-oss-20b | |
-| `gpt-oss-20b-4bit` | openai/gpt-oss-20b | BNB 4-bit |
-| `gpt-oss-120b` | openai/gpt-oss-120b | |
-| `gpt-oss-120b-4bit` | openai/gpt-oss-120b | BNB 4-bit |
+| Alias | Model | VRAM (approx) | Notes |
+|-------|-------|---------------|-------|
+| `gemma4-e2b` | google/gemma-4-E2B-it | ~4 GB | 2B multimodal, bf16 |
+| `gemma4-e4b` | google/gemma-4-E4B-it | ~8 GB | 4B multimodal, bf16 |
+| `gemma4-26b` | google/gemma-4-26B-A4B-it | ~52 GB | 26B MoE (4B active), bf16 |
+| `gemma4-26b-4bit` | google/gemma-4-26B-A4B-it | ~13 GB | BNB 4-bit |
+| `gemma4-31b` | google/gemma-4-31B-it | ~62 GB | 31B dense, bf16 |
+| `gemma4-31b-4bit` | google/gemma-4-31B-it | ~16 GB | BNB 4-bit |
+| `gpt-oss-20b` | openai/gpt-oss-20b | ~40 GB | bf16 |
+| `gpt-oss-20b-4bit` | openai/gpt-oss-20b | ~10 GB | BNB 4-bit |
+| `gpt-oss-120b` | openai/gpt-oss-120b | ~240 GB | bf16, multi-GPU |
+| `gpt-oss-120b-4bit` | openai/gpt-oss-120b | ~60 GB | BNB 4-bit, multi-GPU |
+
+**Single RTX 3090 (24 GB):** `gemma4-e2b`, `gemma4-e4b`, `gemma4-26b-4bit`, `gemma4-31b-4bit`, `gpt-oss-20b-4bit` all fit comfortably. The full-precision 26B/31B/20B models require 48+ GB GPUs.
 
 ### 5. Open the SSH tunnel (on your local machine)
 
@@ -169,8 +171,16 @@ Set `MODEL_ID` to any HuggingFace causal LM. Models with a `chat_template` in th
 
 Everything lives in `server.py`:
 
-- **`load_model`** — loads tokenizer + model at startup; auto-selects device and dtype, optional BNB 4-bit quantization via `LOAD_IN_4BIT=1`
+- **`load_model`** — initializes vLLM's `AsyncLLMEngine` at startup; always uses bf16, optional BNB 4-bit quantization via `LOAD_IN_4BIT=1`
 - **`_build_prompt`** — applies the model's chat template (or plain fallback) to the message list
 - **`POST /v1/messages`** — Anthropic-compatible endpoint, streaming and non-streaming
 - **`POST /v1/chat/completions`** — OpenAI-compatible endpoint, streaming and non-streaming
 - **`GET /v1/models`** — returns the loaded model ID
+
+### Privacy
+
+- vLLM telemetry disabled (`VLLM_NO_USAGE_STATS=1`)
+- Request and stats logging disabled in the engine (`disable_log_requests`, `disable_log_stats`)
+- Uvicorn access logs suppressed (`--no-access-log`)
+- Server binds to `127.0.0.1` only — accessible exclusively through the SSH tunnel
+- No conversation content is stored or logged anywhere

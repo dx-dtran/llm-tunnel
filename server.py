@@ -2,21 +2,18 @@ import os
 import json
 import uuid
 import time
-import asyncio
-import threading
 
-# Disable Hugging Face telemetry before importing transformers/huggingface_hub
+# Disable telemetry before importing anything else
 os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
+os.environ.setdefault("VLLM_NO_USAGE_STATS", "1")
 
-import torch
-import transformers
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
-from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer, BitsAndBytesConfig, AutoConfig
-
-transformers.logging.set_verbosity_error()
+from vllm import AsyncLLMEngine, SamplingParams
+from vllm.engine.arg_utils import AsyncEngineArgs
+from transformers import AutoTokenizer
 
 import logging
 logging.getLogger("uvicorn.access").disabled = True
@@ -30,23 +27,29 @@ app = FastAPI()
 @app.exception_handler(Exception)
 async def _suppress_traceback(_: Request, exc: Exception) -> JSONResponse:
     return JSONResponse(status_code=500, content={"error": {"message": "Internal server error", "type": type(exc).__name__}})
-model: AutoModelForCausalLM = None
+
+engine: AsyncLLMEngine = None
 tokenizer: AutoTokenizer = None
-input_device: torch.device = None
 
 
 @app.on_event("startup")
 async def load_model():
-    global model, tokenizer, input_device
+    global engine, tokenizer
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
-    cfg = AutoConfig.from_pretrained(MODEL_ID)
-    already_quantized = getattr(cfg, "quantization_config", None) is not None
-    quantization_config = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16) if LOAD_IN_4BIT and not already_quantized else None
-    dtype = torch.bfloat16 if LOAD_IN_4BIT and not already_quantized else "auto"
-    model = AutoModelForCausalLM.from_pretrained(MODEL_ID, dtype=dtype, device_map="auto", quantization_config=quantization_config, attn_implementation="sdpa")
-    model.eval()
-    model = torch.compile(model)
-    input_device = next(model.parameters()).device
+
+    engine_kwargs = dict(
+        model=MODEL_ID,
+        dtype="bfloat16",
+        device="auto",
+        disable_log_requests=True,
+        disable_log_stats=True,
+    )
+    if LOAD_IN_4BIT:
+        engine_kwargs["quantization"] = "bitsandbytes"
+        engine_kwargs["load_format"] = "bitsandbytes"
+
+    engine_args = AsyncEngineArgs(**engine_kwargs)
+    engine = AsyncLLMEngine.from_engine_args(engine_args)
 
 
 # ---------- request / response types ----------
@@ -110,58 +113,19 @@ def _build_prompt(chat: list[dict]) -> str:
     return "\n\n".join(parts)
 
 
-def _prepare_inputs(chat: list[dict]):
-    prompt = _build_prompt(chat)
-    encoded = tokenizer(prompt, return_tensors="pt")
-    input_ids = encoded.input_ids.to(input_device)
-    attention_mask = encoded.attention_mask.to(input_device)
-    return input_ids, attention_mask
-
-
-def _make_gen_kwargs(max_tokens: int, temperature: float, top_p: float | None, attention_mask) -> dict:
-    kwargs = dict(
-        max_new_tokens=max_tokens,
-        attention_mask=attention_mask,
-        pad_token_id=tokenizer.eos_token_id,
-    )
+def _make_sampling_params(max_tokens: int, temperature: float, top_p: float | None) -> SamplingParams:
+    kwargs = dict(max_tokens=max_tokens)
     if temperature == 0:
-        kwargs["do_sample"] = False
+        kwargs["temperature"] = 0
     else:
-        kwargs["do_sample"] = True
         kwargs["temperature"] = temperature
     if top_p is not None:
         kwargs["top_p"] = top_p
-    return kwargs
+    return SamplingParams(**kwargs)
 
 
-async def _iter_streamer(input_ids, kwargs: dict):
-    streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
-    kwargs = {**kwargs, "streamer": streamer}
-
-    def _generate():
-        with torch.inference_mode():
-            model.generate(input_ids, **kwargs)
-
-    thread = threading.Thread(target=_generate, daemon=True)
-    thread.start()
-
-    loop = asyncio.get_running_loop()
-    it = iter(streamer)
-
-    def next_chunk():
-        try:
-            return next(it)
-        except StopIteration:
-            return None
-
-    while True:
-        chunk = await loop.run_in_executor(None, next_chunk)
-        if chunk is None:
-            break
-        if chunk:
-            yield chunk
-
-    thread.join()
+def _count_input_tokens(prompt: str) -> int:
+    return len(tokenizer.encode(prompt))
 
 
 # ---------- endpoints ----------
@@ -184,22 +148,22 @@ async def messages(req: MessagesRequest):
     for msg in req.messages:
         chat.append({"role": msg.role, "content": _extract_text(msg.content)})
 
-    input_ids, attention_mask = _prepare_inputs(chat)
-    input_tokens = input_ids.shape[-1]
-    kwargs = _make_gen_kwargs(req.max_tokens, req.temperature, req.top_p, attention_mask)
+    prompt = _build_prompt(chat)
+    input_tokens = _count_input_tokens(prompt)
+    params = _make_sampling_params(req.max_tokens, req.temperature, req.top_p)
     model_name = req.model or MODEL_ID
 
     if req.stream:
         return StreamingResponse(
-            _anthropic_stream(input_ids, input_tokens, kwargs, model_name),
+            _anthropic_stream(prompt, input_tokens, params, model_name),
             media_type="text/event-stream",
         )
 
-    with torch.inference_mode():
-        output = model.generate(input_ids, **kwargs)
-
-    new_ids = output[0][input_tokens:]
-    text = tokenizer.decode(new_ids, skip_special_tokens=True)
+    request_id = f"msg-{uuid.uuid4().hex[:12]}"
+    final = None
+    async for output in engine.generate(prompt, params, request_id):
+        final = output
+    text = final.outputs[0].text
 
     return {
         "id": f"msg_{uuid.uuid4().hex[:24]}",
@@ -209,11 +173,11 @@ async def messages(req: MessagesRequest):
         "model": model_name,
         "stop_reason": "end_turn",
         "stop_sequence": None,
-        "usage": {"input_tokens": input_tokens, "output_tokens": len(new_ids)},
+        "usage": {"input_tokens": input_tokens, "output_tokens": len(final.outputs[0].token_ids)},
     }
 
 
-async def _anthropic_stream(input_ids, input_tokens: int, kwargs: dict, model_name: str):
+async def _anthropic_stream(prompt: str, input_tokens: int, params: SamplingParams, model_name: str):
     msg_id = f"msg_{uuid.uuid4().hex[:24]}"
 
     def sse(event: str, data: dict) -> str:
@@ -230,13 +194,19 @@ async def _anthropic_stream(input_ids, input_tokens: int, kwargs: dict, model_na
     yield sse("content_block_start", {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}})
     yield sse("ping", {"type": "ping"})
 
+    request_id = f"msg-{uuid.uuid4().hex[:12]}"
+    prev_text = ""
     output_tokens = 0
-    async for chunk in _iter_streamer(input_ids, kwargs):
-        output_tokens += 1
-        yield sse("content_block_delta", {
-            "type": "content_block_delta", "index": 0,
-            "delta": {"type": "text_delta", "text": chunk},
-        })
+    async for output in engine.generate(prompt, params, request_id):
+        new_text = output.outputs[0].text
+        delta = new_text[len(prev_text):]
+        prev_text = new_text
+        if delta:
+            output_tokens = len(output.outputs[0].token_ids)
+            yield sse("content_block_delta", {
+                "type": "content_block_delta", "index": 0,
+                "delta": {"type": "text_delta", "text": delta},
+            })
 
     yield sse("content_block_stop", {"type": "content_block_stop", "index": 0})
     yield sse("message_delta", {
@@ -253,23 +223,24 @@ async def _anthropic_stream(input_ids, input_tokens: int, kwargs: dict, model_na
 async def chat_completions(req: ChatRequest):
     chat = [{"role": msg.role, "content": _extract_text(msg.content)} for msg in req.messages]
 
-    input_ids, attention_mask = _prepare_inputs(chat)
-    input_tokens = input_ids.shape[-1]
+    prompt = _build_prompt(chat)
+    input_tokens = _count_input_tokens(prompt)
     max_tokens = req.max_completion_tokens or req.max_tokens or 2048
-    kwargs = _make_gen_kwargs(max_tokens, req.temperature, req.top_p, attention_mask)
+    params = _make_sampling_params(max_tokens, req.temperature, req.top_p)
     model_name = req.model or MODEL_ID
 
     if req.stream:
         return StreamingResponse(
-            _oai_stream(input_ids, input_tokens, kwargs, model_name),
+            _oai_stream(prompt, input_tokens, params, model_name),
             media_type="text/event-stream",
         )
 
-    with torch.inference_mode():
-        output = model.generate(input_ids, **kwargs)
-
-    new_ids = output[0][input_tokens:]
-    text = tokenizer.decode(new_ids, skip_special_tokens=True)
+    request_id = f"oai-{uuid.uuid4().hex[:12]}"
+    final = None
+    async for output in engine.generate(prompt, params, request_id):
+        final = output
+    text = final.outputs[0].text
+    output_tokens = len(final.outputs[0].token_ids)
 
     return {
         "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
@@ -277,28 +248,33 @@ async def chat_completions(req: ChatRequest):
         "created": int(time.time()),
         "model": model_name,
         "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
-        "usage": {"prompt_tokens": input_tokens, "completion_tokens": len(new_ids), "total_tokens": input_tokens + len(new_ids)},
+        "usage": {"prompt_tokens": input_tokens, "completion_tokens": output_tokens, "total_tokens": input_tokens + output_tokens},
     }
 
 
-async def _oai_stream(input_ids, input_tokens: int, kwargs: dict, model_name: str):
+async def _oai_stream(prompt: str, input_tokens: int, params: SamplingParams, model_name: str):
     msg_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     created = int(time.time())
 
     def sse(data: dict) -> str:
         return f"data: {json.dumps(data)}\n\n"
 
-    # opening chunk with role
     yield sse({
         "id": msg_id, "object": "chat.completion.chunk", "created": created, "model": model_name,
         "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}],
     })
 
-    async for chunk in _iter_streamer(input_ids, kwargs):
-        yield sse({
-            "id": msg_id, "object": "chat.completion.chunk", "created": created, "model": model_name,
-            "choices": [{"index": 0, "delta": {"content": chunk}, "finish_reason": None}],
-        })
+    request_id = f"oai-{uuid.uuid4().hex[:12]}"
+    prev_text = ""
+    async for output in engine.generate(prompt, params, request_id):
+        new_text = output.outputs[0].text
+        delta = new_text[len(prev_text):]
+        prev_text = new_text
+        if delta:
+            yield sse({
+                "id": msg_id, "object": "chat.completion.chunk", "created": created, "model": model_name,
+                "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}],
+            })
 
     yield sse({
         "id": msg_id, "object": "chat.completion.chunk", "created": created, "model": model_name,
