@@ -521,8 +521,8 @@ def _quantize_int4(weight: torch.Tensor, groupsize: int = 128):
 
     Returns:
       weight_packed:    aten int4pack tensor (opaque layout, CPU-side before GPU move)
-      scales_and_zeros: [N, K//groupsize, 1] float32
-                        Each f32 packs (scale, zero) as two bfloat16 values.
+      scales_and_zeros: [K//groupsize, N, 2] bfloat16  (matches gpt-fast convention)
+                        [..., 0] = scale, [..., 1] = zero
                         dequant formula: (q - 8) * scale + zero
     """
     N, K = weight.shape
@@ -550,14 +550,15 @@ def _quantize_int4(weight: torch.Tensor, groupsize: int = 128):
     # _convert_weight_to_int4pack expects [N, K] int32 with values in [0, 15].
     weight_packed = torch.ops.aten._convert_weight_to_int4pack(w_int4, _INNER_K_TILES)
 
-    # Pack scales and zeros: two bfloat16 values per float32 element.
+    # Pack scales and zeros matching gpt-fast's pack_scales_and_zeros:
+    #   stack → [N, K//groupsize, 2] bf16, transpose → [K//groupsize, N, 2] bf16
     scales_bf16 = scales.reshape(N, -1).to(torch.bfloat16)  # [N, K//groupsize]
     zeros_bf16  = zeros.reshape(N, -1).to(torch.bfloat16)
-    # stack → [N, K//groupsize, 2] bf16, view → [N, K//groupsize, 1] f32
     scales_and_zeros = (
-        torch.stack([scales_bf16, zeros_bf16], dim=-1)
-        .view(torch.float32)
-    )   # [N, K//groupsize, 1] float32
+        torch.stack([scales_bf16, zeros_bf16], dim=-1)  # [N, K//groupsize, 2] bf16
+        .transpose(0, 1)                                  # [K//groupsize, N, 2] bf16
+        .contiguous()
+    )   # [K//groupsize, N, 2] bfloat16
 
     return weight_packed, scales_and_zeros
 
@@ -573,8 +574,8 @@ class Int4Linear(nn.Module):
         # weight_packed: opaque int4pack layout — shape managed by aten
         self.register_buffer("weight_packed", torch.empty(0, dtype=torch.int32))
         self.register_buffer("scales_and_zeros",
-                             torch.empty((out_features, in_features // groupsize, 1),
-                                         dtype=torch.float32))
+                             torch.empty((in_features // groupsize, out_features, 2),
+                                         dtype=torch.bfloat16))
 
     @classmethod
     def from_linear(cls, linear: nn.Linear, groupsize: int = 128) -> "Int4Linear":
