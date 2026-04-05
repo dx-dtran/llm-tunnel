@@ -503,6 +503,84 @@ def generate(model: Gemma4Model, prompt_tokens: list[int], max_new_tokens: int,
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# Int4 quantization (native PyTorch — no external deps)
+# ═══════════════════════════════════════════════════════════════════════
+
+def _quantize_int4(weight: torch.Tensor, groupsize: int = 128, inner_k_tiles: int = 8):
+    """Group-wise asymmetric int4 quantization using PyTorch's native packed format.
+
+    Returns (weight_int4pack, scales_and_zeros) ready for _weight_int4pack_mm.
+      weight_int4pack:  packed int32 tensor
+      scales_and_zeros: [K // groupsize, N, 2] bfloat16
+    """
+    N, K = weight.shape
+    assert K % groupsize == 0
+    assert K % (inner_k_tiles * 16) == 0
+    assert N % 8 == 0
+
+    w = weight.float().reshape(N, K // groupsize, groupsize)
+
+    wmin = w.min(dim=-1).values   # [N, K // groupsize]
+    wmax = w.max(dim=-1).values
+
+    scale = ((wmax - wmin) / 15.0).clamp(min=1e-7)
+
+    w_int4 = torch.clamp(
+        torch.round((w - wmin.unsqueeze(-1)) / scale.unsqueeze(-1)),
+        0, 15,
+    ).to(torch.int32).reshape(N, K)
+
+    weight_int4pack = torch.ops.aten._convert_weight_to_int4pack(w_int4, inner_k_tiles)
+
+    # Kernel dequant: (q - 8) * scale + bias  →  bias = wmin + 8 * scale
+    bias = wmin + 8.0 * scale
+    scales_and_zeros = torch.stack(
+        [scale.t().contiguous(), bias.t().contiguous()], dim=2
+    ).to(torch.bfloat16)  # [K // groupsize, N, 2]
+
+    return weight_int4pack, scales_and_zeros
+
+
+class Int4Linear(nn.Module):
+    """nn.Linear replacement using native PyTorch int4 weight-only quantization."""
+
+    def __init__(self, in_features: int, out_features: int,
+                 groupsize: int = 128, inner_k_tiles: int = 8):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.groupsize = groupsize
+
+    @classmethod
+    def from_linear(cls, linear: nn.Linear, groupsize: int = 128,
+                    inner_k_tiles: int = 8) -> "Int4Linear":
+        layer = cls(linear.in_features, linear.out_features, groupsize, inner_k_tiles)
+        w_pack, s_z = _quantize_int4(linear.weight.data, groupsize, inner_k_tiles)
+        layer.register_buffer("weight", w_pack)
+        layer.register_buffer("scales_and_zeros", s_z)
+        return layer
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        orig = x.shape
+        x = x.reshape(-1, self.in_features).to(torch.bfloat16)
+        out = torch.ops.aten._weight_int4pack_mm(
+            x, self.weight, self.groupsize, self.scales_and_zeros
+        )
+        return out.reshape(*orig[:-1], self.out_features)
+
+
+def quantize_model_int4(model: nn.Module, groupsize: int = 128) -> None:
+    """Replace all compatible nn.Linear layers in-place with Int4Linear."""
+    for name, child in list(model.named_children()):
+        if isinstance(child, nn.Linear):
+            N, K = child.weight.shape
+            if K % groupsize == 0 and K % 128 == 0 and N % 8 == 0:
+                setattr(model, name, Int4Linear.from_linear(child, groupsize))
+        else:
+            quantize_model_int4(child, groupsize)
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # Weight loading
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -598,16 +676,10 @@ def load_model(model_id: str, quantize: bool = True, max_seq_len: int = 8192,
     print("Loading weights...")
     load_weights(model, model_path)
 
-    # Quantize (int4 weight-only via torchao)
+    # Quantize (int4 weight-only, native PyTorch)
     if quantize:
         print("Quantizing (int4 weight-only)...")
-        from torchao.quantization import quantize_
-        try:
-            from torchao.quantization import int4_weight_only
-            quantize_(model, int4_weight_only(group_size=128))
-        except ImportError:
-            from torchao.quantization import Int4WeightOnlyConfig
-            quantize_(model, Int4WeightOnlyConfig(group_size=128))
+        quantize_model_int4(model)
         print("  Done")
 
     # Move to device
