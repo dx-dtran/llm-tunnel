@@ -46,7 +46,7 @@ def permute_partial(w, n_head, head_dim, rotary_dim):
     return w.reshape(n_head * head_dim, dim)
 
 
-@torch.inference_mode()
+@torch.no_grad()
 def convert_hf_checkpoint(
     *,
     checkpoint_dir: Path = Path("checkpoints/google/gemma-4-31B-it"),

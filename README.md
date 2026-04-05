@@ -291,7 +291,7 @@ python gemma4/convert_hf_checkpoint.py --checkpoint_dir ../.hf_home/hub/models--
 
 ```
 python gemma4/quantize.py \
-  --checkpoint_path ../.hf_home/hub/models--google--gemma-4-31B-it/snapshots/419b2efe421994fdfd3394e621983d4cc511cd4f/model.pth \
+  --checkpoint_dir ../.hf_home/hub/models--google--gemma-4-31B-it/snapshots/419b2efe421994fdfd3394e621983d4cc511cd4f/ \
   --mode int4 --groupsize 128 \
   --model_name gemma-4-31B-it
 
