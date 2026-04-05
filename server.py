@@ -13,7 +13,6 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from vllm import AsyncLLMEngine, SamplingParams
 from vllm.engine.arg_utils import AsyncEngineArgs
-from transformers import AutoTokenizer
 
 import logging
 logging.getLogger("uvicorn.access").disabled = True
@@ -29,13 +28,12 @@ async def _suppress_traceback(_: Request, exc: Exception) -> JSONResponse:
     return JSONResponse(status_code=500, content={"error": {"message": "Internal server error", "type": type(exc).__name__}})
 
 engine: AsyncLLMEngine = None
-tokenizer: AutoTokenizer = None
+tokenizer = None
 
 
 @app.on_event("startup")
 async def load_model():
     global engine, tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
 
     engine_kwargs = dict(
         model=MODEL_ID,
@@ -50,6 +48,7 @@ async def load_model():
 
     engine_args = AsyncEngineArgs(**engine_kwargs)
     engine = AsyncLLMEngine.from_engine_args(engine_args)
+    tokenizer = await engine.get_tokenizer()
 
 
 # ---------- request / response types ----------
