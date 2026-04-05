@@ -77,10 +77,15 @@ Models are downloaded automatically on first run and cached for all subsequent r
 | `gpt-oss-20b` | openai/gpt-oss-20b | ~16 GB | natively MXFP4 quantized |
 | `gpt-oss-120b` | openai/gpt-oss-120b | ~60 GB | natively MXFP4 quantized |
 | `gpt-oss-120b-awq` | twhitworth/gpt-oss-120b-awq-w4a16 | ~34 GB | AWQ W4A16, works on non-Hopper GPUs |
+| `qwq-32b` | Qwen/QwQ-32B | ~64 GB | thinking model, bf16 |
+| `qwq-32b-fp8` | modelscope/QwQ-32B-FP8 | ~32 GB | thinking model, FP8 pre-quantized |
+| `qwq-32b-awq` | Qwen/QwQ-32B-AWQ | ~20 GB | thinking model, AWQ W4A16 |
+| `deepseek-r1-qwen-32b` | deepseek-ai/DeepSeek-R1-Distill-Qwen-32B | ~64 GB | thinking model, 32B distill, bf16 |
+| `qwen3-32b` | Qwen/Qwen3-32B | ~64 GB | thinking model, bf16 |
 
 Pre-quantized models (FP8, NVFP4, MXFP4, AWQ) are detected automatically by vLLM — no extra flags needed. The gpt-oss models ship as MXFP4 natively; that's already their fast format.
 
-**Single RTX 3090 (24 GB):** `gemma4-e2b`, `gemma4-e4b`, `gpt-oss-20b` fit comfortably. For 40–80 GB GPUs (A100/H100): `gemma4-26b-fp8`, `gpt-oss-120b`, `gpt-oss-120b-awq`. `gemma4-31b-nvfp4` requires a Hopper (H100) or Blackwell GPU.
+**Single RTX 3090 (24 GB):** `gemma4-e2b`, `gemma4-e4b`, `gpt-oss-20b`, `qwq-32b-awq` fit comfortably. For 40–80 GB GPUs (A100/H100): `gemma4-26b-fp8`, `gpt-oss-120b`, `gpt-oss-120b-awq`, `qwq-32b-fp8`. `gemma4-31b-nvfp4` requires a Hopper (H100) or Blackwell GPU. Full-precision 32B thinking models need ~64 GB.
 
 ### 5. Open the SSH tunnel (on your local machine)
 
@@ -152,16 +157,108 @@ No changes needed in LibreChat or its config. Just make sure the SSH tunnel is r
 
 ---
 
-## Other clients
+## Thinking models
 
-**Chatbox** — Settings → AI Provider → OpenAI API → API Host: `http://localhost:8080`, API Key: `dummy`
+Reasoning models (QwQ-32B, DeepSeek-R1, Qwen3) emit `<think>...</think>` blocks before their response. The server automatically detects and separates this content, exposing it in the correct format for each API:
 
-**Claude Code / aider (Anthropic SDK)**:
+**Anthropic API** — thinking appears as a separate content block before the text:
+
+```json
+{
+  "content": [
+    {"type": "thinking", "thinking": "Let me work through this..."},
+    {"type": "text", "text": "The answer is 42."}
+  ]
+}
+```
+
+During streaming, thinking arrives via `thinking_delta` events, then regular `text_delta` events after `</think>`.
+
+**OpenAI API** — thinking appears in a `reasoning_content` field on the message (DeepSeek-compatible format):
+
+```json
+{
+  "choices": [{
+    "message": {
+      "role": "assistant",
+      "reasoning_content": "Let me work through this...",
+      "content": "The answer is 42."
+    }
+  }]
+}
+```
+
+During streaming, `delta.reasoning_content` carries the thinking tokens; `delta.content` carries the response.
+
+The `thinking` request parameter (used by the Anthropic SDK to request extended thinking) is accepted and ignored — the model decides whether to think based on its own architecture. Non-thinking models are completely unaffected.
+
+---
+
+## Coding agents
+
+The server works with any coding agent that supports a custom OpenAI-compatible or Anthropic-compatible base URL. All agents below connect via `http://localhost:8080` through the SSH tunnel.
+
+| Agent | API | Recommended |
+|-------|-----|-------------|
+| [Aider](https://aider.chat) | OpenAI | CLI-based, excellent model support, handles `reasoning_content` |
+| [Cline](https://github.com/cline/cline) (VS Code) | OpenAI or Anthropic | IDE-integrated, supports both formats, active development |
+| [Goose](https://github.com/block/goose) | OpenAI or Anthropic | Block's open-source agent, tool-use focused |
+| [Continue](https://continue.dev) (VS Code/JetBrains) | OpenAI | IDE-integrated autocomplete + chat |
+| [Open Interpreter](https://openinterpreter.com) | OpenAI | Runs code locally, general-purpose |
+| [Claude Code](https://claude.ai/code) | Anthropic | Anthropic's own CLI; works via `ANTHROPIC_BASE_URL` |
+| [LibreChat](https://librechat.ai) | OpenAI | GUI chat, see setup below |
+| Chatbox | OpenAI | Lightweight GUI chat |
+
+### Aider
+
+```bash
+aider \
+  --openai-api-base http://localhost:8080/v1 \
+  --openai-api-key dummy \
+  --model openai/qwq-32b   # use whatever MODEL_ID you started the server with
+```
+
+### Cline (VS Code)
+
+Settings → Provider: **OpenAI Compatible** → Base URL: `http://localhost:8080/v1`, API Key: `dummy`, Model: your model ID.
+
+Or use the Anthropic provider: Settings → Provider: **Anthropic** → then set `ANTHROPIC_BASE_URL=http://localhost:8080` in your shell before launching VS Code.
+
+### Goose
+
+```bash
+export GOOSE_PROVIDER=openai
+export OPENAI_HOST=http://localhost:8080
+export OPENAI_API_KEY=dummy
+goose session
+```
+
+### Continue
+
+In `~/.continue/config.yaml`:
+
+```yaml
+models:
+  - name: Local Model
+    provider: openai
+    model: your-model-id
+    apiBase: http://localhost:8080/v1
+    apiKey: dummy
+```
+
+### Claude Code
 
 ```bash
 export ANTHROPIC_API_KEY=dummy
 export ANTHROPIC_BASE_URL=http://localhost:8080
+claude
 ```
+
+Note: Claude Code is optimized for Claude's specific capabilities. It works, but local models may struggle with the tool-use patterns Claude Code relies on. QwQ-32B and Qwen3-32B handle tool use best among the thinking models.
+
+### Chatbox
+
+Settings → AI Provider → OpenAI API → API Host: `http://localhost:8080`, API Key: `dummy`
 
 ---
 

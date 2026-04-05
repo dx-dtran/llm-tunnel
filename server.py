@@ -60,6 +60,7 @@ class MessagesRequest(BaseModel):
     temperature: float = 1.0
     top_p: float | None = None
     stop_sequences: list[str] | None = None
+    thinking: dict | None = None
 
 
 class ChatRequest(BaseModel):
@@ -120,6 +121,30 @@ def _count_input_tokens(prompt: str) -> int:
     return len(tokenizer.encode(prompt))
 
 
+_THINK_OPEN = "<think>"
+_THINK_CLOSE = "</think>"
+_THINK_OPEN_LEN = len(_THINK_OPEN)
+
+
+def _parse_thinking(text: str) -> tuple[str, str, bool]:
+    """Split cumulative model output into (thinking, response, is_still_thinking).
+
+    Only detects <think> at position 0 (how all reasoning models behave).
+    """
+    if not text.startswith(_THINK_OPEN):
+        return ("", text, False)
+
+    end_idx = text.find(_THINK_CLOSE)
+    if end_idx == -1:
+        return (text[_THINK_OPEN_LEN:], "", True)
+
+    thinking = text[_THINK_OPEN_LEN:end_idx]
+    response = text[end_idx + len(_THINK_CLOSE):]
+    if response.startswith("\n"):
+        response = response[1:]
+    return (thinking, response, False)
+
+
 # ---------- endpoints ----------
 
 @app.get("/v1/models")
@@ -156,12 +181,18 @@ async def messages(req: MessagesRequest):
     async for output in engine.generate(prompt, params, request_id):
         final = output
     text = final.outputs[0].text
+    thinking, response, _ = _parse_thinking(text)
+
+    content = []
+    if thinking:
+        content.append({"type": "thinking", "thinking": thinking})
+    content.append({"type": "text", "text": response})
 
     return {
         "id": f"msg_{uuid.uuid4().hex[:24]}",
         "type": "message",
         "role": "assistant",
-        "content": [{"type": "text", "text": text}],
+        "content": content,
         "model": model_name,
         "stop_reason": "end_turn",
         "stop_sequence": None,
@@ -183,24 +214,63 @@ async def _anthropic_stream(prompt: str, input_tokens: int, params: SamplingPara
             "usage": {"input_tokens": input_tokens, "output_tokens": 0},
         },
     })
-    yield sse("content_block_start", {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}})
     yield sse("ping", {"type": "ping"})
 
     request_id = f"msg-{uuid.uuid4().hex[:12]}"
-    prev_text = ""
+    phase = "buffering"  # "buffering" | "thinking" | "responding"
+    block_index = 0
+    thinking_emitted = 0
+    response_emitted = 0
     output_tokens = 0
-    async for output in engine.generate(prompt, params, request_id):
-        new_text = output.outputs[0].text
-        delta = new_text[len(prev_text):]
-        prev_text = new_text
-        if delta:
-            output_tokens = len(output.outputs[0].token_ids)
-            yield sse("content_block_delta", {
-                "type": "content_block_delta", "index": 0,
-                "delta": {"type": "text_delta", "text": delta},
-            })
+    full_text = ""
 
-    yield sse("content_block_stop", {"type": "content_block_stop", "index": 0})
+    async for output in engine.generate(prompt, params, request_id):
+        full_text = output.outputs[0].text
+        output_tokens = len(output.outputs[0].token_ids)
+
+        if phase == "buffering":
+            if len(full_text) < _THINK_OPEN_LEN:
+                continue
+            if full_text.startswith(_THINK_OPEN):
+                phase = "thinking"
+                yield sse("content_block_start", {"type": "content_block_start", "index": 0,
+                           "content_block": {"type": "thinking", "thinking": ""}})
+            else:
+                phase = "responding"
+                yield sse("content_block_start", {"type": "content_block_start", "index": 0,
+                           "content_block": {"type": "text", "text": ""}})
+
+        if phase == "thinking":
+            thinking, response, still = _parse_thinking(full_text)
+            delta_t = thinking[thinking_emitted:]
+            thinking_emitted = len(thinking)
+            if delta_t:
+                yield sse("content_block_delta", {"type": "content_block_delta", "index": 0,
+                           "delta": {"type": "thinking_delta", "thinking": delta_t}})
+            if not still:
+                phase = "responding"
+                yield sse("content_block_stop", {"type": "content_block_stop", "index": 0})
+                block_index = 1
+                yield sse("content_block_start", {"type": "content_block_start", "index": 1,
+                           "content_block": {"type": "text", "text": ""}})
+
+        if phase == "responding":
+            _, response, _ = _parse_thinking(full_text)
+            delta_r = response[response_emitted:]
+            response_emitted = len(response)
+            if delta_r:
+                yield sse("content_block_delta", {"type": "content_block_delta", "index": block_index,
+                           "delta": {"type": "text_delta", "text": delta_r}})
+
+    # Generation ended while still buffering (very short output, no <think>)
+    if phase == "buffering":
+        yield sse("content_block_start", {"type": "content_block_start", "index": 0,
+                   "content_block": {"type": "text", "text": ""}})
+        if full_text:
+            yield sse("content_block_delta", {"type": "content_block_delta", "index": 0,
+                       "delta": {"type": "text_delta", "text": full_text}})
+
+    yield sse("content_block_stop", {"type": "content_block_stop", "index": block_index})
     yield sse("message_delta", {
         "type": "message_delta",
         "delta": {"stop_reason": "end_turn", "stop_sequence": None},
@@ -233,13 +303,18 @@ async def chat_completions(req: ChatRequest):
         final = output
     text = final.outputs[0].text
     output_tokens = len(final.outputs[0].token_ids)
+    thinking, response, _ = _parse_thinking(text)
+
+    message = {"role": "assistant", "content": response}
+    if thinking:
+        message["reasoning_content"] = thinking
 
     return {
         "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
         "object": "chat.completion",
         "created": int(time.time()),
         "model": model_name,
-        "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
+        "choices": [{"index": 0, "message": message, "finish_reason": "stop"}],
         "usage": {"prompt_tokens": input_tokens, "completion_tokens": output_tokens, "total_tokens": input_tokens + output_tokens},
     }
 
@@ -251,25 +326,45 @@ async def _oai_stream(prompt: str, input_tokens: int, params: SamplingParams, mo
     def sse(data: dict) -> str:
         return f"data: {json.dumps(data)}\n\n"
 
-    yield sse({
-        "id": msg_id, "object": "chat.completion.chunk", "created": created, "model": model_name,
-        "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}],
-    })
+    def chunk(delta: dict, finish_reason=None) -> dict:
+        return {"id": msg_id, "object": "chat.completion.chunk", "created": created,
+                "model": model_name, "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}]}
+
+    yield sse(chunk({"role": "assistant", "content": ""}))
 
     request_id = f"oai-{uuid.uuid4().hex[:12]}"
-    prev_text = ""
-    async for output in engine.generate(prompt, params, request_id):
-        new_text = output.outputs[0].text
-        delta = new_text[len(prev_text):]
-        prev_text = new_text
-        if delta:
-            yield sse({
-                "id": msg_id, "object": "chat.completion.chunk", "created": created, "model": model_name,
-                "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}],
-            })
+    phase = "buffering"
+    thinking_emitted = 0
+    response_emitted = 0
+    full_text = ""
 
-    yield sse({
-        "id": msg_id, "object": "chat.completion.chunk", "created": created, "model": model_name,
-        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-    })
+    async for output in engine.generate(prompt, params, request_id):
+        full_text = output.outputs[0].text
+
+        if phase == "buffering":
+            if len(full_text) < _THINK_OPEN_LEN:
+                continue
+            phase = "thinking" if full_text.startswith(_THINK_OPEN) else "responding"
+
+        if phase == "thinking":
+            thinking, response, still = _parse_thinking(full_text)
+            delta_t = thinking[thinking_emitted:]
+            thinking_emitted = len(thinking)
+            if delta_t:
+                yield sse(chunk({"reasoning_content": delta_t}))
+            if not still:
+                phase = "responding"
+
+        if phase == "responding":
+            _, response, _ = _parse_thinking(full_text)
+            delta_r = response[response_emitted:]
+            response_emitted = len(response)
+            if delta_r:
+                yield sse(chunk({"content": delta_r}))
+
+    # Generation ended while still buffering
+    if phase == "buffering" and full_text:
+        yield sse(chunk({"content": full_text}))
+
+    yield sse(chunk({}, finish_reason="stop"))
     yield "data: [DONE]\n\n"

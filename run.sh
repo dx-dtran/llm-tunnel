@@ -20,6 +20,12 @@ declare -A MODELS=(
     ["gpt-oss-120b"]="openai/gpt-oss-120b"
     # GPT-OSS — AWQ W4A16 (community quant, ~7x smaller, works on non-Hopper GPUs)
     ["gpt-oss-120b-awq"]="twhitworth/gpt-oss-120b-awq-w4a16"
+    # Thinking / reasoning models (output <think>...</think> blocks)
+    ["qwq-32b"]="Qwen/QwQ-32B"
+    ["qwq-32b-fp8"]="modelscope/QwQ-32B-FP8"
+    ["qwq-32b-awq"]="Qwen/QwQ-32B-AWQ"
+    ["deepseek-r1-qwen-32b"]="deepseek-ai/DeepSeek-R1-Distill-Qwen-32B"
+    ["qwen3-32b"]="Qwen/Qwen3-32B"
 )
 
 if [ -z "$1" ] || [ -z "${MODELS[$1]+x}" ]; then
