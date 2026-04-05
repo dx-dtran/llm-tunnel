@@ -512,68 +512,76 @@ def generate(model: Gemma4Model, prompt_tokens: list[int], max_new_tokens: int,
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# Int4 quantization — pure Python, no aten int4 ops
+# Int4 quantization — fused dequant+matmul via aten._weight_int4pack_mm
 #
-# Weights stored as [N, K//2] uint8 (2 int4 per byte).
-# Dequantized to bf16 at inference time before F.linear.
-# Guaranteed 0.5 bytes/weight regardless of PyTorch version.
+# Weights stored in PyTorch's native int4pack format (hardware-friendly).
+# The forward pass never materializes full-precision weights in memory;
+# dequantization happens inside the fused CUDA kernel alongside the matmul.
+#
+# Requires PyTorch >= 2.3 and a CUDA device.
 # ═══════════════════════════════════════════════════════════════════════
 
+# inner_k_tiles controls the CUDA kernel tiling. 8 is fastest for large K.
+_INNER_K_TILES = 8
+
+
 def _quantize_int4(weight: torch.Tensor, groupsize: int = 128):
-    """Group-wise asymmetric int4 quantization.
+    """Group-wise asymmetric int4 quantization in aten int4pack format.
 
     Returns:
-      weight_packed:    [N, K//2] uint8  (2 int4 per byte, low nibble first)
-      scales_and_zeros: [K//groupsize, N, 2] bfloat16
-                        [..., 0] = scale, [..., 1] = zero  (zero = min_val + scale*8)
+      weight_packed:    aten int4pack tensor (opaque layout, CPU-side before GPU move)
+      scales_and_zeros: [K//groupsize, N, 2] bfloat16  (matches gpt-fast convention)
+                        [..., 0] = scale, [..., 1] = zero
+                        dequant formula: (q - 8) * scale + zero
     """
     N, K = weight.shape
     assert K % groupsize == 0, f"K={K} not divisible by groupsize={groupsize}"
-    assert K % 2 == 0
 
     w = weight.float()
-    w_grouped = w.reshape(-1, groupsize)   # [N * num_groups, groupsize]
+    w_grouped = w.reshape(N, -1, groupsize)          # [N, num_groups, groupsize]
 
-    min_val = w_grouped.amin(dim=1, keepdim=True)
-    max_val = w_grouped.amax(dim=1, keepdim=True)
+    min_val = w_grouped.amin(dim=2, keepdim=True)
+    max_val = w_grouped.amax(dim=2, keepdim=True)
 
     scales = (max_val - min_val).clamp(min=1e-6) / 15.0
-    zeros  = min_val + scales * 8.0   # dequant: (q - 8) * scale + zeros
+    zeros  = min_val + scales * 8.0                  # dequant: (q - 8) * scale + zero
 
     w_int4 = (
         w_grouped.sub(min_val)
         .div(scales)
         .round()
         .clamp_(0, 15)
-        .to(torch.uint8)
+        .to(torch.int32)
         .reshape(N, K)
     )
 
-    # Pack two int4 per byte: low nibble = even columns, high nibble = odd columns
-    weight_packed = (w_int4[:, 0::2] | (w_int4[:, 1::2] << 4)).contiguous()
+    # Convert to hardware-optimised int4pack layout.
+    # _convert_weight_to_int4pack expects [N, K] int32 with values in [0, 15].
+    weight_packed = torch.ops.aten._convert_weight_to_int4pack(w_int4, _INNER_K_TILES)
 
-    scales = scales.reshape(N, -1)   # [N, K // groupsize]
-    zeros  = zeros.reshape(N, -1)
+    # Pack scales and zeros matching gpt-fast's pack_scales_and_zeros:
+    #   stack → [N, K//groupsize, 2] bf16, transpose → [K//groupsize, N, 2] bf16
+    scales_bf16 = scales.reshape(N, -1).to(torch.bfloat16)  # [N, K//groupsize]
+    zeros_bf16  = zeros.reshape(N, -1).to(torch.bfloat16)
     scales_and_zeros = (
-        torch.cat([scales.unsqueeze(2), zeros.unsqueeze(2)], dim=2)
-        .transpose(0, 1)
+        torch.stack([scales_bf16, zeros_bf16], dim=-1)  # [N, K//groupsize, 2] bf16
+        .transpose(0, 1)                                  # [K//groupsize, N, 2] bf16
         .contiguous()
-        .to(torch.bfloat16)
-    )   # [K // groupsize, N, 2]
+    )   # [K//groupsize, N, 2] bfloat16
 
     return weight_packed, scales_and_zeros
 
 
 class Int4Linear(nn.Module):
-    """nn.Linear replacement: weights stored as int4-packed uint8, dequantized at runtime."""
+    """nn.Linear replacement using fused int4 dequant+matmul (no intermediate weights)."""
 
     def __init__(self, in_features: int, out_features: int, groupsize: int = 128):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.groupsize = groupsize
-        self.register_buffer("weight_packed",
-                             torch.empty((out_features, in_features // 2), dtype=torch.uint8))
+        # weight_packed: opaque int4pack layout — shape managed by aten
+        self.register_buffer("weight_packed", torch.empty(0, dtype=torch.int32))
         self.register_buffer("scales_and_zeros",
                              torch.empty((in_features // groupsize, out_features, 2),
                                          dtype=torch.bfloat16))
@@ -586,36 +594,38 @@ class Int4Linear(nn.Module):
         layer.scales_and_zeros = s_z
         return layer
 
-    def _dequantize(self) -> torch.Tensor:
-        # Unpack nibbles: [N, K//2] → [N, K]
-        low  = (self.weight_packed & 0xF).to(torch.float32)
-        high = (self.weight_packed >> 4).to(torch.float32)
-        w = torch.stack([low, high], dim=2).reshape(self.out_features, self.in_features)
-        # scales/zeros: [K//groupsize, N, 2] → [N, K]
-        s = self.scales_and_zeros[:, :, 0].t().float()   # [N, K//groupsize]
-        z = self.scales_and_zeros[:, :, 1].t().float()
-        s = s.repeat_interleave(self.groupsize, dim=1)
-        z = z.repeat_interleave(self.groupsize, dim=1)
-        return ((w - 8.0) * s + z).to(torch.bfloat16)
-
     def materialize(self):
         """Dequantize once and cache as a bf16 buffer. Drops packed weights to save VRAM.
 
-        Note: this trades int4 VRAM savings for inference speed. The materialized
-        bf16 weight uses 4x more VRAM than the packed int4 form. Only call this
-        if the model fits in VRAM at bf16 size.
+        Useful when the model fits in VRAM at bf16 and you want to use plain
+        F.linear (e.g. for large-batch prefill). For single-token decode,
+        _weight_int4pack_mm is already optimal — materialize is not needed.
         """
         if not hasattr(self, "_weight_bf16"):
-            self.register_buffer("_weight_bf16", self._dequantize())
+            # Dequantize using the fused kernel: pass an identity to extract weights.
+            # scales_and_zeros: [K//groupsize, N, 2] bf16
+            # output of _weight_int4pack_mm with eye(K): [K, N] = weight.T → transpose → [N, K]
+            K, N = self.in_features, self.out_features
+            eye = torch.eye(K, dtype=torch.bfloat16, device=self.weight_packed.device)
+            w_bf16 = torch.ops.aten._weight_int4pack_mm(
+                eye, self.weight_packed, self.groupsize, self.scales_and_zeros
+            ).t().contiguous()  # [N, K]
+            self.register_buffer("_weight_bf16", w_bf16)
             del self.weight_packed
             del self.scales_and_zeros
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.to(torch.bfloat16)
         if hasattr(self, "_weight_bf16"):
-            w = self._weight_bf16
-        else:
-            w = self._dequantize()
-        return F.linear(x.to(torch.bfloat16), w)
+            # Post-materialize path: plain bf16 matmul (fastest for large batches)
+            return F.linear(x, self._weight_bf16)
+        # Default: fused dequant+matmul — never allocates a full-precision weight tensor
+        origin_shape = x.shape
+        x_2d = x.reshape(-1, self.in_features)
+        out = torch.ops.aten._weight_int4pack_mm(
+            x_2d, self.weight_packed, self.groupsize, self.scales_and_zeros
+        )
+        return out.reshape(*origin_shape[:-1], self.out_features)
 
 
 def quantize_model_int4(model: nn.Module, groupsize: int = 128) -> None:
