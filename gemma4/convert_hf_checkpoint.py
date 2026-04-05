@@ -117,6 +117,9 @@ def convert_hf_checkpoint(
         "post_attention_layernorm.weight": "post_attention_norm.weight",
         "pre_feedforward_layernorm.weight": "ffn_norm.weight",
         "post_feedforward_layernorm.weight": "post_ffn_norm.weight",
+        "self_attn.q_norm.weight": "attention.q_norm.weight",
+        "self_attn.k_norm.weight": "attention.k_norm.weight",
+        "layer_scalar": "layer_scalar",
     }
 
     final_result = {}

@@ -186,6 +186,9 @@ class TransformerBlock(nn.Module):
         self.post_attention_norm = GemmaRMSNorm(config.dim, config.norm_eps)
         self.ffn_norm = GemmaRMSNorm(config.dim, config.norm_eps)
         self.post_ffn_norm = GemmaRMSNorm(config.dim, config.norm_eps)
+        # Global layers: per-layer scaling of full output
+        if not self.is_sliding:
+            self.register_buffer("layer_scalar", torch.ones(1))
 
     def forward(
         self, x: Tensor, input_pos: Tensor, freqs_cis: Tensor, mask: Tensor
@@ -199,6 +202,8 @@ class TransformerBlock(nn.Module):
         h = self.feed_forward(self.ffn_norm(h))
         h = self.post_ffn_norm(h)
         out = r + h
+        if not self.is_sliding:
+            out = out * self.layer_scalar
         return out
 
 
@@ -228,6 +233,12 @@ class Attention(nn.Module):
         self.wqkv = nn.Linear(config.dim, total_dim, bias=False)
         self.wo = nn.Linear(self.q_dim, config.dim, bias=False)
         self.kv_cache = None
+
+        # Global layers: QK norm (with learned scale) + V norm (no scale, for K=V sharing)
+        if not self.is_sliding:
+            self.q_norm = GemmaRMSNorm(self.head_dim, config.norm_eps)
+            self.k_norm = GemmaRMSNorm(self.head_dim, config.norm_eps)
+            self.v_norm = GemmaRMSNorm(self.head_dim, config.norm_eps, with_scale=False)
 
         self._register_load_state_dict_pre_hook(self.load_hook)
 
@@ -269,6 +280,9 @@ class Attention(nn.Module):
             q = apply_rotary_emb(q, freqs_cis)
             k = apply_rotary_emb(k, freqs_cis)
         else:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
+            v = self.v_norm(v)
             q = apply_partial_rotary_emb(q, freqs_cis, self.rotary_dim)
             k = apply_partial_rotary_emb(k, freqs_cis, self.rotary_dim)
 
@@ -301,17 +315,21 @@ class FeedForward(nn.Module):
 class GemmaRMSNorm(nn.Module):
     """Gemma-style RMSNorm: weight is an offset added to 1.0."""
 
-    def __init__(self, dim: int, eps: float = 1e-6):
+    def __init__(self, dim: int, eps: float = 1e-6, with_scale: bool = True):
         super().__init__()
         self.eps = eps
-        self.weight = nn.Parameter(torch.zeros(dim))
+        self.with_scale = with_scale
+        if with_scale:
+            self.weight = nn.Parameter(torch.zeros(dim))
 
     def _norm(self, x):
         return x * torch.rsqrt(torch.mean(x * x, dim=-1, keepdim=True) + self.eps)
 
     def forward(self, x: Tensor) -> Tensor:
         output = self._norm(x.float()).type_as(x)
-        return output * (1.0 + self.weight)
+        if self.with_scale:
+            return output * (1.0 + self.weight)
+        return output
 
 
 def precompute_freqs_cis(
