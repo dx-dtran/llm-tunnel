@@ -1,0 +1,7 @@
+torch
+torchao
+safetensors
+huggingface_hub
+transformers
+fastapi
+uvicorn

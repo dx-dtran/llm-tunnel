@@ -57,7 +57,7 @@ class Gemma4Config:
             num_hidden_layers=tc["num_hidden_layers"],
             num_attention_heads=tc["num_attention_heads"],
             num_key_value_heads=tc["num_key_value_heads"],
-            num_global_key_value_heads=tc.get("num_global_key_value_heads", 4),
+            num_global_key_value_heads=tc.get("num_global_key_value_heads") or tc["num_key_value_heads"],
             head_dim=tc["head_dim"],
             global_head_dim=tc.get("global_head_dim", 512),
             rms_norm_eps=tc["rms_norm_eps"],
@@ -80,50 +80,69 @@ class Gemma4Config:
 # ═══════════════════════════════════════════════════════════════════════
 
 class RMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6):
+    """Gemma 4 RMSNorm — weight initialized to ones, no +1 offset."""
+
+    def __init__(self, dim: int, eps: float = 1e-6, with_scale: bool = True):
         super().__init__()
         self.eps = eps
-        self.weight = nn.Parameter(torch.zeros(dim))  # Gemma inits to 0, adds 1
+        self.with_scale = with_scale
+        if with_scale:
+            self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.rms_norm(x, self.weight.shape, self.weight + 1.0, self.eps)
+        x_float = x.float()
+        normed = x_float * torch.rsqrt(x_float.pow(2).mean(-1, keepdim=True) + self.eps)
+        if self.with_scale:
+            normed = normed * self.weight.float()
+        return normed.type_as(x)
 
 
 # ─── Rotary position embeddings ────────────────────────────────────────
 
 def _precompute_rope(dim: int, max_len: int, theta: float, device: torch.device):
-    """Returns cos, sin tensors of shape [max_len, dim//2]."""
+    """Precompute cos/sin for RoPE.
+
+    Returns cos, sin each of shape [max_len, dim] (full dim, not dim//2).
+    Uses the rotate_half convention: pairs are (x[i], x[i + dim//2]).
+    """
+    half = dim // 2
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2, device=device, dtype=torch.float32) / dim))
     t = torch.arange(max_len, device=device, dtype=torch.float32)
-    angles = torch.outer(t, freqs)  # [max_len, dim//2]
-    return angles.cos(), angles.sin()
+    angles = torch.outer(t, freqs)  # [max_len, half]
+    # Double up for rotate_half convention: [cos, cos] so element-wise multiply works
+    cos = torch.cat([angles.cos(), angles.cos()], dim=-1)  # [max_len, dim]
+    sin = torch.cat([angles.sin(), angles.sin()], dim=-1)  # [max_len, dim]
+    return cos, sin
+
+
+def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+    """Rotate pairs: split into halves, negate second, swap."""
+    half = x.shape[-1] // 2
+    x1 = x[..., :half]
+    x2 = x[..., half:]
+    return torch.cat([-x2, x1], dim=-1)
 
 
 def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
                 pos: torch.Tensor, rotary_dim: Optional[int] = None):
-    """Apply rotary embeddings.
+    """Apply rotary embeddings using rotate_half convention.
 
     x:   [batch, n_heads, seq_len, head_dim]
-    cos: [max_len, rotary_dim//2]
-    sin: [max_len, rotary_dim//2]
+    cos: [max_len, rope_dim]
+    sin: [max_len, rope_dim]
     pos: [seq_len] — absolute position indices
+    rotary_dim: if set, only rotate the first rotary_dim dimensions (partial rotary)
     """
     if rotary_dim is not None and rotary_dim < x.shape[-1]:
         x_rot, x_pass = x.split([rotary_dim, x.shape[-1] - rotary_dim], dim=-1)
     else:
         x_rot, x_pass = x, None
 
-    # Gather cos/sin for the given positions: [seq_len, dim//2]
-    c = cos[pos]  # [seq_len, dim//2]
-    s = sin[pos]
-    # Broadcast to [1, 1, seq_len, dim//2]
-    c = c.unsqueeze(0).unsqueeze(0)
-    s = s.unsqueeze(0).unsqueeze(0)
+    # Gather cos/sin at positions: [seq_len, rope_dim] → [1, 1, seq_len, rope_dim]
+    c = cos[pos].unsqueeze(0).unsqueeze(0)
+    s = sin[pos].unsqueeze(0).unsqueeze(0)
 
-    # Pair-wise rotation: treat last dim as [..., dim//2, 2]
-    x_rot = x_rot.unflatten(-1, (-1, 2))
-    x0, x1 = x_rot.unbind(-1)
-    x_rot = torch.stack([x0 * c - x1 * s, x0 * s + x1 * c], dim=-1).flatten(-2)
+    x_rot = x_rot * c + _rotate_half(x_rot) * s
 
     if x_pass is not None:
         return torch.cat([x_rot, x_pass], dim=-1)
@@ -136,51 +155,69 @@ class Gemma4Attention(nn.Module):
     def __init__(self, config: Gemma4Config, layer_idx: int):
         super().__init__()
         self.layer_type = config.layer_types[layer_idx]
-        is_full = self.layer_type == "full_attention"
+        self.is_sliding = self.layer_type == "sliding_attention"
+        self.is_full = not self.is_sliding
 
         self.n_heads = config.num_attention_heads
-        self.head_dim = config.global_head_dim if is_full else config.head_dim
-        self.n_kv_heads = config.num_global_key_value_heads if is_full else config.num_key_value_heads
-        self.kv_groups = self.n_heads // self.n_kv_heads
-        self.is_full = is_full
+        self.head_dim = config.global_head_dim if self.is_full else config.head_dim
         self.sliding_window = config.sliding_window
 
+        # K=V only applies to full (non-sliding) attention when attention_k_eq_v is set
+        self.use_kv_shared = config.attention_k_eq_v and self.is_full
+        self.n_kv_heads = (config.num_global_key_value_heads if self.use_kv_shared
+                           else config.num_key_value_heads)
+        self.kv_groups = self.n_heads // self.n_kv_heads
+
         # Partial rotary for full attention
-        if is_full:
-            self.rotary_dim = int(config.partial_rotary_factor * self.head_dim)
-        else:
-            self.rotary_dim = self.head_dim  # full rotation
+        self.rotary_dim = (int(config.partial_rotary_factor * self.head_dim)
+                           if self.is_full else self.head_dim)
 
         q_dim = self.n_heads * self.head_dim
         kv_dim = self.n_kv_heads * self.head_dim
 
         self.q_proj = nn.Linear(config.hidden_size, q_dim, bias=False)
         self.k_proj = nn.Linear(config.hidden_size, kv_dim, bias=False)
-        # k_eq_v: no separate v_proj — we reuse K as V
+        self.v_proj = None if self.use_kv_shared else nn.Linear(config.hidden_size, kv_dim, bias=False)
         self.o_proj = nn.Linear(q_dim, config.hidden_size, bias=False)
 
         self.q_norm = RMSNorm(self.head_dim, config.rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, config.rms_norm_eps)
+        # V gets its own norm (no learnable scale), applied instead of RoPE
+        self.v_norm = RMSNorm(self.head_dim, config.rms_norm_eps, with_scale=False)
 
     def forward(self, x: torch.Tensor, rope_cos: torch.Tensor, rope_sin: torch.Tensor,
                 pos: torch.Tensor, kv_cache: "KVCache", layer_idx: int,
                 mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         B, L, _ = x.shape
 
-        q = self.q_proj(x).view(B, L, self.n_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(x).view(B, L, self.n_kv_heads, self.head_dim).transpose(1, 2)
-        v = k  # k_eq_v
+        # Project Q, K
+        q = self.q_proj(x).view(B, L, self.n_heads, self.head_dim)
+        k = self.k_proj(x).view(B, L, self.n_kv_heads, self.head_dim)
 
-        # QK normalization (before RoPE)
+        # V: either from v_proj (sliding) or shared with K (full attention, k_eq_v)
+        # IMPORTANT: assign v BEFORE applying k_norm/RoPE to k
+        if self.v_proj is not None:
+            v = self.v_proj(x).view(B, L, self.n_kv_heads, self.head_dim)
+        else:
+            v = k  # pre-norm, pre-RoPE key states
+
+        # Q: norm → RoPE
         q = self.q_norm(q)
+        q = q.transpose(1, 2)  # [B, n_heads, L, head_dim]
+        q = _apply_rope(q, rope_cos, rope_sin, pos,
+                        self.rotary_dim if self.is_full else None)
+
+        # K: norm → RoPE
         k = self.k_norm(k)
+        k = k.transpose(1, 2)
+        k = _apply_rope(k, rope_cos, rope_sin, pos,
+                        self.rotary_dim if self.is_full else None)
 
-        # RoPE
-        rotary_dim = self.rotary_dim if self.is_full else None
-        q = _apply_rope(q, rope_cos, rope_sin, pos, rotary_dim)
-        k = _apply_rope(k, rope_cos, rope_sin, pos, rotary_dim)
+        # V: norm only (no RoPE)
+        v = self.v_norm(v)
+        v = v.transpose(1, 2)
 
-        # Update KV cache and get full K, V for attention
+        # Update KV cache and retrieve full cached K, V
         k, v = kv_cache.update(layer_idx, k, v, pos)
 
         # Expand KV heads for GQA
@@ -188,7 +225,7 @@ class Gemma4Attention(nn.Module):
             k = k.repeat_interleave(self.kv_groups, dim=1)
             v = v.repeat_interleave(self.kv_groups, dim=1)
 
-        # Attention
+        # Scaled dot-product attention
         scale = 1.0 / math.sqrt(self.head_dim)
         out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, scale=scale)
 
@@ -223,26 +260,27 @@ class Gemma4DecoderLayer(nn.Module):
         self.pre_feedforward_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.post_feedforward_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
 
-        self.layer_scalar = nn.Parameter(torch.ones(1))
+        # Per-layer scalar (buffer, not parameter — initialized to 1.0)
+        self.register_buffer("layer_scalar", torch.ones(1))
 
     def forward(self, x: torch.Tensor, rope_cos: torch.Tensor, rope_sin: torch.Tensor,
                 pos: torch.Tensor, kv_cache: "KVCache", layer_idx: int,
                 mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        # Attention block
+        # Attention block (pre-norm → attn → post-norm → residual)
         residual = x
         x = self.input_layernorm(x)
         x = self.self_attn(x, rope_cos, rope_sin, pos, kv_cache, layer_idx, mask)
         x = self.post_attention_layernorm(x)
         x = residual + x
 
-        # MLP block
+        # MLP block (pre-norm → mlp → post-norm → residual)
         residual = x
         x = self.pre_feedforward_layernorm(x)
         x = self.mlp(x)
         x = self.post_feedforward_layernorm(x)
         x = residual + x
 
-        # Per-layer scaling
+        # Per-layer scaling (applied to full hidden state)
         x = x * self.layer_scalar
         return x
 
@@ -262,21 +300,21 @@ class Gemma4Model(nn.Module):
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.embed_scale = config.hidden_size ** 0.5
 
-        # Precomputed RoPE tables (registered as buffers, will move with .to())
-        # Sliding: full rotation, theta=10k
+        # RoPE tables — populated by setup_rope() after .to(device)
         self._rope_sliding_cos: torch.Tensor
         self._rope_sliding_sin: torch.Tensor
-        # Full: partial rotation, theta=1M
         self._rope_full_cos: torch.Tensor
         self._rope_full_sin: torch.Tensor
 
     def setup_rope(self, max_len: int, device: torch.device):
         """Precompute RoPE cos/sin tables. Call after moving model to device."""
+        # Sliding attention: full rotation on head_dim, theta=10k
         sc, ss = _precompute_rope(self.config.head_dim, max_len,
                                   self.config.rope_theta_sliding, device)
         self._rope_sliding_cos = sc
         self._rope_sliding_sin = ss
 
+        # Full attention: partial rotation on rotary_dim, theta=1M
         rotary_dim = int(self.config.partial_rotary_factor * self.config.global_head_dim)
         fc, fs = _precompute_rope(rotary_dim, max_len,
                                   self.config.rope_theta_full, device)
@@ -336,14 +374,12 @@ class KVCache:
         for i in range(config.num_hidden_layers):
             is_full = config.layer_types[i] == "full_attention"
             hd = config.global_head_dim if is_full else config.head_dim
-            nkv = config.num_global_key_value_heads if is_full else config.num_key_value_heads
+            nkv = (config.num_global_key_value_heads if is_full and config.attention_k_eq_v
+                   else config.num_key_value_heads)
             cache_len = max_seq_len if is_full else config.sliding_window
             shape = (batch_size, nkv, cache_len, hd)
             self.k_caches.append(torch.zeros(shape, device=device, dtype=dtype))
             self.v_caches.append(torch.zeros(shape, device=device, dtype=dtype))
-
-        # Track how many positions have been filled (for full attention layers)
-        self.seq_len = 0
 
     def update(self, layer_idx: int, k: torch.Tensor, v: torch.Tensor,
                pos: torch.Tensor):
@@ -355,20 +391,17 @@ class KVCache:
         is_full = self.config.layer_types[layer_idx] == "full_attention"
 
         if is_full:
-            # Write at the absolute positions
             self.k_caches[layer_idx][:, :, pos] = k
             self.v_caches[layer_idx][:, :, pos] = v
-            # Return everything up to current position
             end = pos[-1].item() + 1
             return (self.k_caches[layer_idx][:, :, :end],
                     self.v_caches[layer_idx][:, :, :end])
         else:
-            # Ring buffer: write at pos % window_size
+            # Ring buffer
             window = self.config.sliding_window
             idx = pos % window
             self.k_caches[layer_idx][:, :, idx] = k
             self.v_caches[layer_idx][:, :, idx] = v
-            # Return all valid entries
             end = min(pos[-1].item() + 1, window)
             return (self.k_caches[layer_idx][:, :, :end],
                     self.v_caches[layer_idx][:, :, :end])
@@ -376,14 +409,13 @@ class KVCache:
     def reset(self):
         for c in self.k_caches + self.v_caches:
             c.zero_()
-        self.seq_len = 0
 
 
 # ═══════════════════════════════════════════════════════════════════════
 # Masks
 # ═══════════════════════════════════════════════════════════════════════
 
-def _make_causal_mask(seq_len: int, device: torch.device, dtype: torch.dtype):
+def _make_causal_mask(seq_len: int, device: torch.device):
     """Standard causal mask for prefill. Returns None for seq_len=1 (decode)."""
     if seq_len <= 1:
         return None
@@ -396,8 +428,7 @@ def _make_sliding_causal_mask(seq_len: int, window: int, device: torch.device):
         return None
     row = torch.arange(seq_len, device=device).unsqueeze(1)
     col = torch.arange(seq_len, device=device).unsqueeze(0)
-    mask = (col <= row) & (row - col < window)
-    return mask
+    return (col <= row) & (row - col < window)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -416,10 +447,8 @@ def _sample(logits: torch.Tensor, temperature: float = 1.0,
         sorted_logits, sorted_idx = torch.sort(logits, descending=True)
         probs = F.softmax(sorted_logits, dim=-1)
         cumulative = probs.cumsum(dim=-1)
-        # Remove tokens with cumulative probability above top_p
         mask = cumulative - probs > top_p
         sorted_logits[mask] = float("-inf")
-        # Scatter back
         logits = sorted_logits.scatter(1, sorted_idx, sorted_logits)
 
     probs = F.softmax(logits, dim=-1)
@@ -448,7 +477,7 @@ def generate(model: Gemma4Model, prompt_tokens: list[int], max_new_tokens: int,
     # ── Prefill ──
     pos = torch.arange(seq_len, device=device)
     sliding_mask = _make_sliding_causal_mask(seq_len, model.config.sliding_window, device)
-    full_mask = _make_causal_mask(seq_len, device, tokens.dtype)
+    full_mask = _make_causal_mask(seq_len, device)
 
     logits = model(tokens, pos, kv_cache, sliding_mask, full_mask)
     next_token = _sample(logits[:, -1], temperature, top_p)
@@ -480,18 +509,23 @@ def generate(model: Gemma4Model, prompt_tokens: list[int], max_new_tokens: int,
 _HF_PREFIX = "model.language_model."
 
 
-def _set_param(model: nn.Module, key: str, tensor: torch.Tensor):
+def _set_param(module: nn.Module, key: str, tensor: torch.Tensor):
     """Navigate dotted key path and set the parameter/buffer in-place."""
     parts = key.split(".")
-    mod = model
+    mod = module
     for p in parts[:-1]:
         mod = getattr(mod, p)
     name = parts[-1]
-    if isinstance(getattr(mod, name, None), nn.Parameter):
-        getattr(mod, name).data.copy_(tensor)
+
+    target = getattr(mod, name, None)
+    if isinstance(target, nn.Parameter):
+        target.data.copy_(tensor)
+    elif isinstance(target, torch.Tensor):
+        # Registered buffer
+        target.copy_(tensor)
     else:
-        # Buffer or raw attribute (e.g. layer_scalar stored as param)
-        setattr(mod, name, nn.Parameter(tensor, requires_grad=False))
+        # Raw attribute
+        setattr(mod, name, tensor)
 
 
 def load_weights(model: Gemma4Model, model_path: str):
@@ -501,32 +535,40 @@ def load_weights(model: Gemma4Model, model_path: str):
         raise FileNotFoundError(f"No safetensors files in {model_path}")
 
     loaded = set()
+    skipped = set()
     for f in files:
         with safe_open(f, framework="pt", device="cpu") as sf:
             for key in sf.keys():
                 # Skip vision tower
                 if "vision_tower" in key or "embed_vision" in key:
                     continue
+
                 # Map HF key to our model key
                 if key.startswith(_HF_PREFIX):
                     local_key = key[len(_HF_PREFIX):]
-                elif key == "model.embed_vision.embedding_projection.weight":
-                    continue
                 else:
                     local_key = key
 
-                # Skip v_proj (k_eq_v: K serves as V)
+                # Skip v_proj for full-attention layers (k_eq_v — they share K as V).
+                # Sliding layers DO have v_proj.
                 if "v_proj" in local_key:
-                    continue
+                    # Check if this layer's attention has v_proj
+                    parts = local_key.split(".")
+                    if len(parts) >= 2 and parts[0] == "layers":
+                        layer_idx = int(parts[1])
+                        if model.layers[layer_idx].self_attn.v_proj is None:
+                            continue  # K=V layer, skip
 
                 tensor = sf.get_tensor(key)
                 try:
                     _set_param(model, local_key, tensor)
                     loaded.add(local_key)
-                except (AttributeError, KeyError):
-                    pass  # skip unexpected keys
+                except (AttributeError, KeyError) as e:
+                    skipped.add(local_key)
 
     print(f"  Loaded {len(loaded)} tensors from {len(files)} files")
+    if skipped:
+        print(f"  Skipped {len(skipped)}: {list(skipped)[:5]}...")
 
 
 def load_model(model_id: str, quantize: bool = True, max_seq_len: int = 8192,
