@@ -503,22 +503,24 @@ def generate(model: Gemma4Model, prompt_tokens: list[int], max_new_tokens: int,
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# Int4 quantization (native PyTorch — no external deps)
+# Int4 quantization — pure Python, no aten int4 ops
+#
+# Weights stored as [N, K//2] uint8 (2 int4 per byte).
+# Dequantized to bf16 at inference time before F.linear.
+# Guaranteed 0.5 bytes/weight regardless of PyTorch version.
 # ═══════════════════════════════════════════════════════════════════════
 
-def _quantize_int4(weight: torch.Tensor, groupsize: int = 128, inner_k_tiles: int = 8):
-    """Group-wise asymmetric int4 quantization using PyTorch's native packed format.
+def _quantize_int4(weight: torch.Tensor, groupsize: int = 128):
+    """Group-wise asymmetric int4 quantization.
 
-    Matches gpt-fast's quantization scheme exactly.
-    Returns (weight_int4pack, scales_and_zeros) ready for _weight_int4pack_mm.
-      weight_int4pack:  packed int32 tensor (hardware format)
-      scales_and_zeros: [K // groupsize, N, 2] bfloat16
-                        [..., 0] = scale, [..., 1] = zero (= min_val + scale * 8)
+    Returns:
+      weight_packed:    [N, K//2] uint8  (2 int4 per byte, low nibble first)
+      scales_and_zeros: [K//groupsize, N, 2] bfloat16
+                        [..., 0] = scale, [..., 1] = zero  (zero = min_val + scale*8)
     """
     N, K = weight.shape
     assert K % groupsize == 0, f"K={K} not divisible by groupsize={groupsize}"
-    assert K % (inner_k_tiles * 16) == 0, f"K={K} not divisible by {inner_k_tiles * 16}"
-    assert N % 8 == 0, f"N={N} not divisible by 8"
+    assert K % 2 == 0
 
     w = weight.float()
     w_grouped = w.reshape(-1, groupsize)   # [N * num_groups, groupsize]
@@ -526,15 +528,9 @@ def _quantize_int4(weight: torch.Tensor, groupsize: int = 128, inner_k_tiles: in
     min_val = w_grouped.amin(dim=1, keepdim=True)
     max_val = w_grouped.amax(dim=1, keepdim=True)
 
-    # scale maps [min_val, max_val] → [0, 15]
     scales = (max_val - min_val).clamp(min=1e-6) / 15.0
+    zeros  = min_val + scales * 8.0   # dequant: (q - 8) * scale + zeros
 
-    # zeros: float value that maps to quantized midpoint 8
-    # dequant formula used by kernel: w ≈ (q - 8) * scale + zeros
-    # → zeros = min_val + scale * 8
-    zeros = min_val + scales * 8.0
-
-    # Quantize: q = clamp(round((w - min_val) / scale), 0, 15)
     w_int4 = (
         w_grouped.sub(min_val)
         .div(scales)
@@ -544,69 +540,64 @@ def _quantize_int4(weight: torch.Tensor, groupsize: int = 128, inner_k_tiles: in
         .reshape(N, K)
     )
 
-    # _convert_weight_to_int4pack must run on CUDA
-    if w_int4.is_cuda:
-        weight_int4pack = torch.ops.aten._convert_weight_to_int4pack(w_int4, inner_k_tiles)
-    else:
-        weight_int4pack = torch.ops.aten._convert_weight_to_int4pack(
-            w_int4.cuda(), inner_k_tiles
-        ).cpu()
+    # Pack two int4 per byte: low nibble = even columns, high nibble = odd columns
+    weight_packed = (w_int4[:, 0::2] | (w_int4[:, 1::2] << 4)).contiguous()
 
-    # Pack into [K // groupsize, N, 2] bfloat16 as expected by _weight_int4pack_mm
     scales = scales.reshape(N, -1)   # [N, K // groupsize]
-    zeros = zeros.reshape(N, -1)
+    zeros  = zeros.reshape(N, -1)
     scales_and_zeros = (
-        torch.cat([scales.unsqueeze(2), zeros.unsqueeze(2)], dim=2)  # [N, K//groupsize, 2]
-        .transpose(0, 1)                                               # [K//groupsize, N, 2]
+        torch.cat([scales.unsqueeze(2), zeros.unsqueeze(2)], dim=2)
+        .transpose(0, 1)
         .contiguous()
         .to(torch.bfloat16)
-    )
+    )   # [K // groupsize, N, 2]
 
-    return weight_int4pack, scales_and_zeros
+    return weight_packed, scales_and_zeros
 
 
 class Int4Linear(nn.Module):
-    """nn.Linear replacement using native PyTorch int4 weight-only quantization."""
+    """nn.Linear replacement: weights stored as int4-packed uint8, dequantized at runtime."""
 
-    def __init__(self, in_features: int, out_features: int,
-                 groupsize: int = 128, inner_k_tiles: int = 8):
+    def __init__(self, in_features: int, out_features: int, groupsize: int = 128):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.groupsize = groupsize
-        self.inner_k_tiles = inner_k_tiles
-        # Register buffers with correct shapes so load_state_dict(assign=True) works
-        # (also works with meta device — buffers are meta tensors in that context)
-        packed_shape = (out_features // 8, in_features // (inner_k_tiles * 16), 32, inner_k_tiles // 2)
-        n_groups = in_features // groupsize
-        self.register_buffer("weight", torch.empty(packed_shape, dtype=torch.int32))
-        self.register_buffer("scales_and_zeros", torch.empty((n_groups, out_features, 2), dtype=torch.bfloat16))
+        self.register_buffer("weight_packed",
+                             torch.empty((out_features, in_features // 2), dtype=torch.uint8))
+        self.register_buffer("scales_and_zeros",
+                             torch.empty((in_features // groupsize, out_features, 2),
+                                         dtype=torch.bfloat16))
 
     @classmethod
-    def from_linear(cls, linear: nn.Linear, groupsize: int = 128,
-                    inner_k_tiles: int = 8) -> "Int4Linear":
-        layer = cls(linear.in_features, linear.out_features, groupsize, inner_k_tiles)
-        w_pack, s_z = _quantize_int4(linear.weight.data, groupsize, inner_k_tiles)
-        layer.weight = w_pack
+    def from_linear(cls, linear: nn.Linear, groupsize: int = 128) -> "Int4Linear":
+        layer = cls(linear.in_features, linear.out_features, groupsize)
+        w_packed, s_z = _quantize_int4(linear.weight.data, groupsize)
+        layer.weight_packed = w_packed
         layer.scales_and_zeros = s_z
         return layer
 
+    def _dequantize(self) -> torch.Tensor:
+        # Unpack nibbles: [N, K//2] → [N, K]
+        low  = (self.weight_packed & 0xF).to(torch.float32)
+        high = (self.weight_packed >> 4).to(torch.float32)
+        w = torch.stack([low, high], dim=2).reshape(self.out_features, self.in_features)
+        # scales/zeros: [K//groupsize, N, 2] → [N, K]
+        s = self.scales_and_zeros[:, :, 0].t().float()   # [N, K//groupsize]
+        z = self.scales_and_zeros[:, :, 1].t().float()
+        s = s.repeat_interleave(self.groupsize, dim=1)
+        z = z.repeat_interleave(self.groupsize, dim=1)
+        return ((w - 8.0) * s + z).to(torch.bfloat16)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        orig = x.shape
-        x = x.reshape(-1, self.in_features).to(torch.bfloat16)
-        out = torch.ops.aten._weight_int4pack_mm(
-            x, self.weight, self.groupsize, self.scales_and_zeros
-        )
-        return out.reshape(*orig[:-1], self.out_features)
+        return F.linear(x.to(torch.bfloat16), self._dequantize())
 
 
 def quantize_model_int4(model: nn.Module, groupsize: int = 128) -> None:
-    """Replace all compatible nn.Linear layers in-place with Int4Linear."""
+    """Replace all nn.Linear layers in-place with Int4Linear."""
     for name, child in list(model.named_children()):
-        if isinstance(child, nn.Linear):
-            N, K = child.weight.shape
-            if K % groupsize == 0 and K % 128 == 0 and N % 8 == 0:
-                setattr(model, name, Int4Linear.from_linear(child, groupsize))
+        if isinstance(child, nn.Linear) and child.weight.shape[1] % groupsize == 0:
+            setattr(model, name, Int4Linear.from_linear(child, groupsize))
         else:
             quantize_model_int4(child, groupsize)
 
@@ -614,10 +605,8 @@ def quantize_model_int4(model: nn.Module, groupsize: int = 128) -> None:
 def _setup_int4_structure(model: nn.Module, groupsize: int = 128) -> None:
     """Replace nn.Linear with empty Int4Linear shells (for loading cached quantized weights)."""
     for name, child in list(model.named_children()):
-        if isinstance(child, nn.Linear):
-            N, K = child.out_features, child.in_features
-            if K % groupsize == 0 and K % 128 == 0 and N % 8 == 0:
-                setattr(model, name, Int4Linear(K, N, groupsize))
+        if isinstance(child, nn.Linear) and child.in_features % groupsize == 0:
+            setattr(model, name, Int4Linear(child.in_features, child.out_features, groupsize))
         else:
             _setup_int4_structure(child, groupsize)
 
