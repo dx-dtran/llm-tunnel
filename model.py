@@ -16,6 +16,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from safetensors import safe_open
 
+# ── Inductor optimizations (same as gpt-fast generate.py) ──
+torch._inductor.config.coordinate_descent_tuning = True
+torch._inductor.config.triton.unique_kernel_names = True
+torch._inductor.config.fx_graph_cache = True
+torch._functorch.config.enable_autograd_cache = True
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # Config
@@ -398,6 +404,7 @@ class KVCache:
         pos:  [new_len] — absolute position indices
         """
         is_full = self.config.layer_types[layer_idx] == "full_attention"
+        new_len = k.shape[2]
 
         if is_full:
             self.k_caches[layer_idx][:, :, pos] = k
@@ -406,11 +413,15 @@ class KVCache:
             return (self.k_caches[layer_idx][:, :, :end],
                     self.v_caches[layer_idx][:, :, :end])
         else:
-            # Ring buffer
+            # Ring buffer for sliding attention
             window = self.config.sliding_window
             idx = pos % window
             self.k_caches[layer_idx][:, :, idx] = k
             self.v_caches[layer_idx][:, :, idx] = v
+            if new_len > 1:
+                # Prefill: return input k,v directly — the sliding causal mask
+                # handles windowing. The ring buffer is populated for decode.
+                return k, v
             end = min(pos[-1].item() + 1, window)
             return (self.k_caches[layer_idx][:, :, :end],
                     self.v_caches[layer_idx][:, :, :end])
@@ -479,9 +490,17 @@ def generate(model: Gemma4Model, prompt_tokens: list[int], max_new_tokens: int,
 
     tokens = torch.tensor([prompt_tokens], device=device, dtype=torch.long)
     seq_len = tokens.shape[1]
-
     max_seq = seq_len + max_new_tokens
-    kv_cache = KVCache(model.config, max_seq, batch_size=1, device=device)
+
+    # Reuse pre-allocated KV cache when possible, otherwise create one
+    if hasattr(model, '_kv_cache') and model._kv_cache.max_seq_len >= max_seq:
+        kv_cache = model._kv_cache
+        kv_cache.reset()
+    else:
+        kv_cache = KVCache(model.config, max_seq, batch_size=1, device=device)
+
+    # Pre-allocate decode position tensor (avoids per-step allocation)
+    decode_pos = torch.zeros(1, device=device, dtype=torch.long)
 
     # ── Prefill ──
     pos = torch.arange(seq_len, device=device)
@@ -498,10 +517,10 @@ def generate(model: Gemma4Model, prompt_tokens: list[int], max_new_tokens: int,
     # ── Decode loop ──
     cur_pos = seq_len
     while cur_pos < max_seq - 1:
-        tokens = next_token.reshape(1, 1)  # [1, 1]
-        pos = torch.tensor([cur_pos], device=device)
+        tokens = next_token.reshape(1, 1)
+        decode_pos.fill_(cur_pos)
 
-        logits = model(tokens, pos, kv_cache, None, None)
+        logits = model(tokens, decode_pos, kv_cache, None, None)
         next_token = _sample(logits[:, -1], temperature, top_p)
 
         cur_pos += 1
@@ -760,22 +779,19 @@ def load_model(model_id: str, quantize: bool = True, max_seq_len: int = 8192,
         model = None
 
     if model is None:
-        # Slow path: build on CPU, load bf16 weights, quantize layer-by-layer on device
-        print("Building model on CPU...")
-        model = Gemma4Model(config)
+        # Slow path: build on CPU in bf16, load weights, quantize layer-by-layer
+        print("Building model on CPU (bf16)...")
+        model = Gemma4Model(config).to(dtype=torch.bfloat16)
 
         print("Loading weights...")
         load_weights(model, model_path)
 
         if quantize:
             print("Quantizing (int4 weight-only)...")
-            # Each linear is moved to `device` individually before packing,
-            # so _convert_weight_to_int4pack gets a CUDA tensor (it's CUDA-only).
             quantize_model_int4(model, device=device)
             torch.cuda.empty_cache()
             print("  Done")
             print("Saving quantized cache for next run...")
-            # Save all tensors on CPU so the cache is device-agnostic
             state_dict_cpu = {
                 k: v.cpu().bfloat16() if v.is_floating_point() else v.cpu()
                 for k, v in model.state_dict().items()
@@ -783,11 +799,14 @@ def load_model(model_id: str, quantize: bool = True, max_seq_len: int = 8192,
             torch.save(state_dict_cpu, cache_path)
 
         print(f"Moving to {device}...")
-        # Moves embeddings/norms (still on CPU) to device; int4pack buffers already there
         model = model.to(device=device, dtype=torch.bfloat16)
 
     model.eval()
     model.setup_rope(max_seq_len, torch.device(device))
+
+    # Pre-allocate KV cache (reused across generate calls)
+    model._kv_cache = KVCache(config, max_seq_len, batch_size=1,
+                              device=torch.device(device))
 
     # Optionally pre-dequantize int4 → bf16 for faster inference (4x more VRAM)
     if quantize and os.environ.get("MATERIALIZE_WEIGHTS", "0") == "1":
@@ -796,6 +815,11 @@ def load_model(model_id: str, quantize: bool = True, max_seq_len: int = 8192,
             if isinstance(m, Int4Linear):
                 m.materialize()
         torch.cuda.empty_cache()
+
+    # torch.compile for kernel fusion (the gpt-fast performance multiplier)
+    if os.environ.get("COMPILE", "1") == "1":
+        print("Compiling model with torch.compile...")
+        model = torch.compile(model)
 
     tokenizer = AutoTokenizer.from_pretrained(model_path)
 
