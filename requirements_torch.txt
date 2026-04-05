@@ -1,5 +1,7 @@
+--extra-index-url https://download.pytorch.org/whl/cu130
 torch
-torchao
+torchao==0.17.0
+mslk-cuda
 safetensors
 huggingface_hub
 transformers
