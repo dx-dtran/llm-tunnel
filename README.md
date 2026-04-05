@@ -299,7 +299,7 @@ python gemma4/quantize.py \
 
 ```
 python gemma4/generate.py \
-  --checkpoint_path ../.hf_home/hub/models--google--gemma-4-31B-it/snapshots/419b2efe421994fdfd3394e621983d4cc511cd4f/model.pth \
+  --checkpoint_path ../.hf_home/hub/models--google--gemma-4-31B-it/snapshots/419b2efe421994fdfd3394e621983d4cc511cd4f/model_int4.g128.pth \
   --model_name gemma-4-31B-it \
   --prompt "Hello, my name is" \
   --max_new_tokens 200

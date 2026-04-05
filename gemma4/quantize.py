@@ -189,7 +189,7 @@ def linear_forward_int4(x, weight_int4pack, scales_and_zeros, out_features, grou
 
 
 def _check_linear_int4_k(k, groupsize=1, inner_k_tiles=1):
-    return k % groupsize == 0 and k % (inner_k_tiles * 16) == 0
+    return k % groupsize == 0 and k % (inner_k_tiles * 8) == 0
 
 
 def replace_linear_int4(module, groupsize, inner_k_tiles, padding):
@@ -315,14 +315,14 @@ class WeightOnlyInt4Linear(torch.nn.Module):
 
         assert out_features % 8 == 0, "require out_features % 8 == 0"
         assert (
-            in_features % (inner_k_tiles * 16) == 0
-        ), "require in_features % (innerKTiles * 16) == 0"
+            in_features % (inner_k_tiles * 8) == 0
+        ), "require in_features % (innerKTiles * 8) == 0"
         self.register_buffer(
             "weight",
             torch.empty(
                 (
                     out_features // 8,
-                    in_features // (inner_k_tiles * 16),
+                    in_features // (inner_k_tiles * 8),
                     32,
                     inner_k_tiles // 2,
                 ),
