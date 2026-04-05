@@ -54,7 +54,7 @@ class Message(BaseModel):
 class MessagesRequest(BaseModel):
     model: str = ""
     messages: list[Message]
-    max_tokens: int = 2048
+    max_tokens: int = 8192
     stream: bool = False
     system: str | None = None
     temperature: float = 1.0
@@ -217,7 +217,7 @@ async def chat_completions(req: ChatRequest):
 
     prompt = _build_prompt(chat)
     input_tokens = _count_input_tokens(prompt)
-    max_tokens = req.max_completion_tokens or req.max_tokens or 2048
+    max_tokens = req.max_completion_tokens or req.max_tokens or 8192
     params = _make_sampling_params(max_tokens, req.temperature, req.top_p)
     model_name = req.model or MODEL_ID
 
