@@ -18,7 +18,6 @@ import logging
 logging.getLogger("uvicorn.access").disabled = True
 
 MODEL_ID = os.environ.get("MODEL_ID", "google/gemma-3-270m-it")
-LOAD_IN_4BIT = os.environ.get("LOAD_IN_4BIT", "0") == "1"
 
 app = FastAPI()
 
@@ -35,15 +34,12 @@ tokenizer = None
 async def load_model():
     global engine, tokenizer
 
-    engine_kwargs = dict(
+    # Pre-quantized models (AWQ, FP8, NVFP4, MXFP4) are auto-detected by vLLM
+    # via each model's quantization_config in config.json — no extra flags needed.
+    engine_args = AsyncEngineArgs(
         model=MODEL_ID,
         dtype="bfloat16",
     )
-    if LOAD_IN_4BIT:
-        engine_kwargs["quantization"] = "bitsandbytes"
-        engine_kwargs["load_format"] = "bitsandbytes"
-
-    engine_args = AsyncEngineArgs(**engine_kwargs)
     engine = AsyncLLMEngine.from_engine_args(engine_args)
     tokenizer = engine.tokenizer
 

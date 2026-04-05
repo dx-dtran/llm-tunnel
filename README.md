@@ -56,7 +56,7 @@ chmod +x run.sh
 ### 4. Start the server
 
 ```bash
-./run.sh gemma4-31b-4bit
+./run.sh gpt-oss-20b
 ```
 
 The server binds to `127.0.0.1` only — it is not reachable from the public internet, only via the SSH tunnel.
@@ -67,18 +67,20 @@ Models are downloaded automatically on first run and cached for all subsequent r
 
 | Alias | Model | VRAM (approx) | Notes |
 |-------|-------|---------------|-------|
+| `gemma3-270m` | google/gemma-3-270m-it | ~1 GB | tiny, for local testing |
 | `gemma4-e2b` | google/gemma-4-E2B-it | ~4 GB | 2B multimodal, bf16 |
 | `gemma4-e4b` | google/gemma-4-E4B-it | ~8 GB | 4B multimodal, bf16 |
 | `gemma4-26b` | google/gemma-4-26B-A4B-it | ~52 GB | 26B MoE (4B active), bf16 |
-| `gemma4-26b-4bit` | google/gemma-4-26B-A4B-it | ~13 GB | BNB 4-bit |
+| `gemma4-26b-fp8` | protoLabsAI/gemma-4-26B-A4B-it-FP8 | ~26 GB | FP8 pre-quantized, no quality loss |
 | `gemma4-31b` | google/gemma-4-31B-it | ~62 GB | 31B dense, bf16 |
-| `gemma4-31b-4bit` | google/gemma-4-31B-it | ~16 GB | BNB 4-bit |
-| `gpt-oss-20b` | openai/gpt-oss-20b | ~40 GB | bf16 |
-| `gpt-oss-20b-4bit` | openai/gpt-oss-20b | ~10 GB | BNB 4-bit |
-| `gpt-oss-120b` | openai/gpt-oss-120b | ~240 GB | bf16, multi-GPU |
-| `gpt-oss-120b-4bit` | openai/gpt-oss-120b | ~60 GB | BNB 4-bit, multi-GPU |
+| `gemma4-31b-nvfp4` | nvidia/Gemma-4-31B-IT-NVFP4 | ~16 GB | NVFP4, Hopper/Blackwell GPU required |
+| `gpt-oss-20b` | openai/gpt-oss-20b | ~16 GB | natively MXFP4 quantized |
+| `gpt-oss-120b` | openai/gpt-oss-120b | ~60 GB | natively MXFP4 quantized |
+| `gpt-oss-120b-awq` | twhitworth/gpt-oss-120b-awq-w4a16 | ~34 GB | AWQ W4A16, works on non-Hopper GPUs |
 
-**Single RTX 3090 (24 GB):** `gemma4-e2b`, `gemma4-e4b`, `gemma4-26b-4bit`, `gemma4-31b-4bit`, `gpt-oss-20b-4bit` all fit comfortably. The full-precision 26B/31B/20B models require 48+ GB GPUs.
+Pre-quantized models (FP8, NVFP4, MXFP4, AWQ) are detected automatically by vLLM — no extra flags needed. The gpt-oss models ship as MXFP4 natively; that's already their fast format.
+
+**Single RTX 3090 (24 GB):** `gemma4-e2b`, `gemma4-e4b`, `gpt-oss-20b` fit comfortably. For 40–80 GB GPUs (A100/H100): `gemma4-26b-fp8`, `gpt-oss-120b`, `gpt-oss-120b-awq`. `gemma4-31b-nvfp4` requires a Hopper (H100) or Blackwell GPU.
 
 ### 5. Open the SSH tunnel (on your local machine)
 
@@ -171,7 +173,7 @@ Set `MODEL_ID` to any HuggingFace causal LM. Models with a `chat_template` in th
 
 Everything lives in `server.py`:
 
-- **`load_model`** — initializes vLLM's `AsyncLLMEngine` at startup; always uses bf16, optional BNB 4-bit quantization via `LOAD_IN_4BIT=1`
+- **`load_model`** — initializes vLLM's `AsyncLLMEngine` at startup; uses bf16, with quantization auto-detected from the model's config (AWQ, FP8, NVFP4, MXFP4 all work out of the box)
 - **`_build_prompt`** — applies the model's chat template (or plain fallback) to the message list
 - **`POST /v1/messages`** — Anthropic-compatible endpoint, streaming and non-streaming
 - **`POST /v1/chat/completions`** — OpenAI-compatible endpoint, streaming and non-streaming

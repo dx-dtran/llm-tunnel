@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# model alias → "HF_MODEL_ID [trust_remote_code]"
+# model alias → HF_MODEL_ID
 declare -A MODELS=(
     # Local testing
     ["gemma3-270m"]="google/gemma-3-270m-it"
@@ -10,15 +10,16 @@ declare -A MODELS=(
     # Gemma 4 — full precision
     ["gemma4-26b"]="google/gemma-4-26B-A4B-it"
     ["gemma4-31b"]="google/gemma-4-31B-it"
-    # Gemma 4 — 4-bit (runtime BNB quantization)
-    ["gemma4-26b-4bit"]="google/gemma-4-26B-A4B-it 4bit"
-    ["gemma4-31b-4bit"]="google/gemma-4-31B-it 4bit"
-    # GPT-OSS — full precision
+    # Gemma 4 — pre-quantized (fastest inference)
+    # FP8: no quality loss, 175 tok/s on H100
+    ["gemma4-26b-fp8"]="protoLabsAI/gemma-4-26B-A4B-it-FP8"
+    # NVFP4: NVIDIA Model Optimizer quant, requires Hopper/Blackwell GPU
+    ["gemma4-31b-nvfp4"]="nvidia/Gemma-4-31B-IT-NVFP4"
+    # GPT-OSS — natively MXFP4 quantized (vLLM auto-detects, no extra flags needed)
     ["gpt-oss-20b"]="openai/gpt-oss-20b"
     ["gpt-oss-120b"]="openai/gpt-oss-120b"
-    # GPT-OSS — 4-bit (runtime BNB quantization)
-    ["gpt-oss-20b-4bit"]="openai/gpt-oss-20b 4bit"
-    ["gpt-oss-120b-4bit"]="openai/gpt-oss-120b 4bit"
+    # GPT-OSS — AWQ W4A16 (community quant, ~7x smaller, works on non-Hopper GPUs)
+    ["gpt-oss-120b-awq"]="twhitworth/gpt-oss-120b-awq-w4a16"
 )
 
 if [ -z "$1" ] || [ -z "${MODELS[$1]+x}" ]; then
@@ -26,20 +27,15 @@ if [ -z "$1" ] || [ -z "${MODELS[$1]+x}" ]; then
     echo ""
     echo "Available models:"
     for key in $(echo "${!MODELS[@]}" | tr ' ' '\n' | sort); do
-        hf_id=$(echo "${MODELS[$key]}" | awk '{print $1}')
-        printf "  %-25s %s\n" "$key" "$hf_id"
+        printf "  %-25s %s\n" "$key" "${MODELS[$key]}"
     done
     echo ""
     echo "Models download automatically on first run and are cached for subsequent runs."
     exit 1
 fi
 
-entry="${MODELS[$1]}"
-MODEL_ID=$(echo "$entry" | awk '{print $1}')
-LOAD_IN_4BIT=$(echo "$entry" | grep -q "4bit" && echo "1" || echo "0")
-
+MODEL_ID="${MODELS[$1]}"
 export MODEL_ID
-export LOAD_IN_4BIT
 
 fuser -k 8080/tcp 2>/dev/null; sleep 1
 
