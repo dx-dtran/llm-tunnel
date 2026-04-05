@@ -509,34 +509,58 @@ def generate(model: Gemma4Model, prompt_tokens: list[int], max_new_tokens: int,
 def _quantize_int4(weight: torch.Tensor, groupsize: int = 128, inner_k_tiles: int = 8):
     """Group-wise asymmetric int4 quantization using PyTorch's native packed format.
 
+    Matches gpt-fast's quantization scheme exactly.
     Returns (weight_int4pack, scales_and_zeros) ready for _weight_int4pack_mm.
-      weight_int4pack:  packed int32 tensor
+      weight_int4pack:  packed int32 tensor (hardware format)
       scales_and_zeros: [K // groupsize, N, 2] bfloat16
+                        [..., 0] = scale, [..., 1] = zero (= min_val + scale * 8)
     """
     N, K = weight.shape
-    assert K % groupsize == 0
-    assert K % (inner_k_tiles * 16) == 0
-    assert N % 8 == 0
+    assert K % groupsize == 0, f"K={K} not divisible by groupsize={groupsize}"
+    assert K % (inner_k_tiles * 16) == 0, f"K={K} not divisible by {inner_k_tiles * 16}"
+    assert N % 8 == 0, f"N={N} not divisible by 8"
 
-    w = weight.float().reshape(N, K // groupsize, groupsize)
+    w = weight.float()
+    w_grouped = w.reshape(-1, groupsize)   # [N * num_groups, groupsize]
 
-    wmin = w.min(dim=-1).values   # [N, K // groupsize]
-    wmax = w.max(dim=-1).values
+    min_val = w_grouped.amin(dim=1, keepdim=True)
+    max_val = w_grouped.amax(dim=1, keepdim=True)
 
-    scale = ((wmax - wmin) / 15.0).clamp(min=1e-7)
+    # scale maps [min_val, max_val] → [0, 15]
+    scales = (max_val - min_val).clamp(min=1e-6) / 15.0
 
-    w_int4 = torch.clamp(
-        torch.round((w - wmin.unsqueeze(-1)) / scale.unsqueeze(-1)),
-        0, 15,
-    ).to(torch.int32).reshape(N, K)
+    # zeros: float value that maps to quantized midpoint 8
+    # dequant formula used by kernel: w ≈ (q - 8) * scale + zeros
+    # → zeros = min_val + scale * 8
+    zeros = min_val + scales * 8.0
 
-    weight_int4pack = torch.ops.aten._convert_weight_to_int4pack(w_int4, inner_k_tiles)
+    # Quantize: q = clamp(round((w - min_val) / scale), 0, 15)
+    w_int4 = (
+        w_grouped.sub(min_val)
+        .div(scales)
+        .round()
+        .clamp_(0, 15)
+        .to(torch.int32)
+        .reshape(N, K)
+    )
 
-    # Kernel dequant: (q - 8) * scale + bias  →  bias = wmin + 8 * scale
-    bias = wmin + 8.0 * scale
-    scales_and_zeros = torch.stack(
-        [scale.t().contiguous(), bias.t().contiguous()], dim=2
-    ).to(torch.bfloat16)  # [K // groupsize, N, 2]
+    # _convert_weight_to_int4pack must run on CUDA
+    if w_int4.is_cuda:
+        weight_int4pack = torch.ops.aten._convert_weight_to_int4pack(w_int4, inner_k_tiles)
+    else:
+        weight_int4pack = torch.ops.aten._convert_weight_to_int4pack(
+            w_int4.cuda(), inner_k_tiles
+        ).cpu()
+
+    # Pack into [K // groupsize, N, 2] bfloat16 as expected by _weight_int4pack_mm
+    scales = scales.reshape(N, -1)   # [N, K // groupsize]
+    zeros = zeros.reshape(N, -1)
+    scales_and_zeros = (
+        torch.cat([scales.unsqueeze(2), zeros.unsqueeze(2)], dim=2)  # [N, K//groupsize, 2]
+        .transpose(0, 1)                                               # [K//groupsize, N, 2]
+        .contiguous()
+        .to(torch.bfloat16)
+    )
 
     return weight_int4pack, scales_and_zeros
 
