@@ -718,9 +718,9 @@ def load_model(model_id: str, quantize: bool = True, max_seq_len: int = 8192,
         with torch.device("meta"):
             model = Gemma4Model(config)
         _setup_int4_structure(model)
-        state_dict = torch.load(cache_path, map_location=device, weights_only=True)
+        state_dict = torch.load(cache_path, map_location="cpu", weights_only=True)
         model.load_state_dict(state_dict, assign=True)
-        model = model.to(dtype=torch.bfloat16)
+        model = model.to(device=device, dtype=torch.bfloat16)
     else:
         # Slow path: build on CPU, load bf16 weights, quantize
         print("Building model on CPU...")
@@ -735,7 +735,12 @@ def load_model(model_id: str, quantize: bool = True, max_seq_len: int = 8192,
             torch.cuda.empty_cache()
             print("  Done")
             print("Saving quantized cache for next run...")
-            torch.save(model.state_dict(), cache_path)
+            # Cast float tensors to bf16 before saving (halves cache size)
+            state_dict_bf16 = {
+                k: v.bfloat16() if v.is_floating_point() else v
+                for k, v in model.state_dict().items()
+            }
+            torch.save(state_dict_bf16, cache_path)
 
         print(f"Moving to {device}...")
         model = model.to(device=device, dtype=torch.bfloat16)
