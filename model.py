@@ -628,13 +628,19 @@ class Int4Linear(nn.Module):
         return out.reshape(*origin_shape[:-1], self.out_features)
 
 
-def quantize_model_int4(model: nn.Module, groupsize: int = 128) -> None:
-    """Replace all nn.Linear layers in-place with Int4Linear."""
+def quantize_model_int4(model: nn.Module, groupsize: int = 128, device: str = "cpu") -> None:
+    """Replace all nn.Linear layers in-place with Int4Linear.
+
+    _convert_weight_to_int4pack is CUDA-only; pass device="cuda" to move each
+    linear to CUDA before packing (one layer at a time — no full-model VRAM spike).
+    """
     for name, child in list(model.named_children()):
         if isinstance(child, nn.Linear) and child.weight.shape[1] % groupsize == 0:
+            if device != "cpu":
+                child = child.to(device=device)
             setattr(model, name, Int4Linear.from_linear(child, groupsize))
         else:
-            quantize_model_int4(child, groupsize)
+            quantize_model_int4(child, groupsize, device)
 
 
 def _setup_int4_structure(model: nn.Module, groupsize: int = 128) -> None:
@@ -739,14 +745,22 @@ def load_model(model_id: str, quantize: bool = True, max_seq_len: int = 8192,
     if quantize and os.path.exists(cache_path):
         # Fast path: meta build + load cached quantized weights directly to GPU
         print("Loading cached quantized model...")
-        with torch.device("meta"):
-            model = Gemma4Model(config)
-        _setup_int4_structure(model)
-        state_dict = torch.load(cache_path, map_location="cpu", weights_only=True)
-        model.load_state_dict(state_dict, assign=True)
-        model = model.to(device=device, dtype=torch.bfloat16)
+        try:
+            with torch.device("meta"):
+                model = Gemma4Model(config)
+            _setup_int4_structure(model)
+            state_dict = torch.load(cache_path, map_location="cpu", weights_only=True)
+            model.load_state_dict(state_dict, assign=True)
+            model = model.to(device=device, dtype=torch.bfloat16)
+        except Exception as e:
+            print(f"  Cache invalid ({e}), deleting and re-quantizing...")
+            os.remove(cache_path)
+            model = None
     else:
-        # Slow path: build on CPU, load bf16 weights, quantize
+        model = None
+
+    if model is None:
+        # Slow path: build on CPU, load bf16 weights, quantize layer-by-layer on device
         print("Building model on CPU...")
         model = Gemma4Model(config)
 
@@ -755,18 +769,21 @@ def load_model(model_id: str, quantize: bool = True, max_seq_len: int = 8192,
 
         if quantize:
             print("Quantizing (int4 weight-only)...")
-            quantize_model_int4(model)
+            # Each linear is moved to `device` individually before packing,
+            # so _convert_weight_to_int4pack gets a CUDA tensor (it's CUDA-only).
+            quantize_model_int4(model, device=device)
             torch.cuda.empty_cache()
             print("  Done")
             print("Saving quantized cache for next run...")
-            # Cast float tensors to bf16 before saving (halves cache size)
-            state_dict_bf16 = {
-                k: v.bfloat16() if v.is_floating_point() else v
+            # Save all tensors on CPU so the cache is device-agnostic
+            state_dict_cpu = {
+                k: v.cpu().bfloat16() if v.is_floating_point() else v.cpu()
                 for k, v in model.state_dict().items()
             }
-            torch.save(state_dict_bf16, cache_path)
+            torch.save(state_dict_cpu, cache_path)
 
         print(f"Moving to {device}...")
+        # Moves embeddings/norms (still on CPU) to device; int4pack buffers already there
         model = model.to(device=device, dtype=torch.bfloat16)
 
     model.eval()
