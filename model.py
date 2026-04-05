@@ -540,7 +540,7 @@ def _quantize_int4(weight: torch.Tensor, groupsize: int = 128, inner_k_tiles: in
         .div(scales)
         .round()
         .clamp_(0, 15)
-        .to(torch.int32)
+        .to(torch.uint8)
         .reshape(N, K)
     )
 
