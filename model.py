@@ -601,8 +601,13 @@ def load_model(model_id: str, quantize: bool = True, max_seq_len: int = 8192,
     # Quantize (int4 weight-only via torchao)
     if quantize:
         print("Quantizing (int4 weight-only)...")
-        from torchao.quantization import quantize_, int4_weight_only
-        quantize_(model, int4_weight_only(group_size=128))
+        from torchao.quantization import quantize_
+        try:
+            from torchao.quantization import int4_weight_only
+            quantize_(model, int4_weight_only(group_size=128))
+        except ImportError:
+            from torchao.quantization import Int4WeightOnlyConfig
+            quantize_(model, Int4WeightOnlyConfig(group_size=128))
         print("  Done")
 
     # Move to device
