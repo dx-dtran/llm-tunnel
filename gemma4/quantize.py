@@ -2,6 +2,7 @@
 
 import time
 from pathlib import Path
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -352,6 +353,7 @@ def quantize(
     mode: str = "int8",
     groupsize: int = 128,
     label: str = "",
+    model_name: Optional[str] = None,
 ) -> None:
     assert checkpoint_path.is_file(), checkpoint_path
 
@@ -362,7 +364,7 @@ def quantize(
     t0 = time.time()
 
     with torch.device("meta"):
-        model = Transformer.from_name(checkpoint_path.parent.name)
+        model = Transformer.from_name(model_name or checkpoint_path.parent.name)
 
     checkpoint = torch.load(str(checkpoint_path), mmap=True, weights_only=True)
     model.load_state_dict(checkpoint, assign=True)
@@ -433,6 +435,12 @@ if __name__ == "__main__":
         default="_",
         help="label to add to output filename",
     )
+    parser.add_argument(
+        "--model_name",
+        type=str,
+        default=None,
+        help="Model name (e.g. gemma-4-31B-it). Required if checkpoint_path parent dir doesn't contain the model name.",
+    )
 
     args = parser.parse_args()
-    quantize(args.checkpoint_path, args.mode, args.groupsize, args.label)
+    quantize(args.checkpoint_path, args.mode, args.groupsize, args.label, args.model_name)

@@ -154,9 +154,9 @@ def encode_tokens(tokenizer, string, bos=True, device="cuda"):
     return torch.tensor(tokens, dtype=torch.int, device=device)
 
 
-def _load_model(checkpoint_path, device, precision, use_tp):
+def _load_model(checkpoint_path, device, precision, use_tp, model_name=None):
     with torch.device("meta"):
-        model = Transformer.from_name(checkpoint_path.parent.name)
+        model = Transformer.from_name(model_name or checkpoint_path.parent.name)
 
     if "int8" in str(checkpoint_path):
         print("Using int8 weight-only quantization!")
@@ -217,6 +217,7 @@ def main(
     compile_prefill: bool = False,
     profile: Optional[Path] = None,
     device=default_device,
+    model_name: Optional[str] = None,
 ) -> None:
     """Generates text samples based on a pre-trained Gemma 4 model and tokenizer."""
     assert checkpoint_path.is_file(), checkpoint_path
@@ -238,7 +239,7 @@ def main(
 
     print("Loading model ...")
     t0 = time.time()
-    model = _load_model(checkpoint_path, device, precision, use_tp)
+    model = _load_model(checkpoint_path, device, precision, use_tp, model_name)
 
     device_sync(device=device)
     print(f"Time to load model: {time.time() - t0:.02f} seconds")
@@ -386,6 +387,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--device", type=str, default=default_device, help="Device to use"
     )
+    parser.add_argument(
+        "--model_name",
+        type=str,
+        default=None,
+        help="Model name (e.g. gemma-4-31B-it). Required if checkpoint_path parent dir doesn't contain the model name.",
+    )
 
     args = parser.parse_args()
     main(
@@ -400,4 +407,5 @@ if __name__ == "__main__":
         args.compile_prefill,
         args.profile,
         args.device,
+        args.model_name,
     )

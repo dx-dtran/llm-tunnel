@@ -283,3 +283,12 @@ Everything lives in `server.py`:
 - Uvicorn access logs suppressed (`--no-access-log`)
 - Server binds to `127.0.0.1` only — accessible exclusively through the SSH tunnel
 - No conversation content is stored or logged anywhere
+
+
+```
+python gemma4/convert_hf_checkpoint.py --checkpoint_dir ../.hf_home/hub/models--google--gemma-4-31B-it/snapshots/419b2efe421994fdfd3394e621983d4cc511cd4f --model_name gemma-4-31B-it
+```
+
+```
+python gemma4/quantize.py --checkpoint_path ../.hf_home/hub/models--google--gemma-4-31B-it/snapshots/419b2efe421994fdfd3394e621983d4cc511cd4f/model.pth --mode int4 --groupsize 128
+```
