@@ -398,6 +398,9 @@ def quantize(
         )
 
     quantize_path = dir_name / new_base_name
+    # Delete the source checkpoint to free disk space before saving
+    print(f"Removing {checkpoint_path} to free disk space ...")
+    checkpoint_path.unlink(missing_ok=True)
     print(f"Writing quantized weights to {quantize_path}")
     quantize_path.unlink(missing_ok=True)
     torch.save(quantized_state_dict, quantize_path)
