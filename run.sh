@@ -48,7 +48,18 @@ MODEL_ID="${MODELS[$1]}"
 export MODEL_ID
 export HF_HUB_DISABLE_XET=1
 
+# Backend: "vllm" (default) or "torch" (pure PyTorch, no vLLM dependency)
+BACKEND="${BACKEND:-vllm}"
+
 fuser -k 8080/tcp 2>/dev/null; sleep 1
 
 echo "Model: $MODEL_ID"
-uvicorn server:app --host 127.0.0.1 --port 8080 --no-access-log
+echo "Backend: $BACKEND"
+
+if [ "$BACKEND" = "torch" ]; then
+    # Pure PyTorch backend — lighter deps, int4 quantization at load time
+    # Set QUANTIZE=0 to skip quantization (e.g. for small models)
+    uvicorn server_torch:app --host 127.0.0.1 --port 8080 --no-access-log
+else
+    uvicorn server:app --host 127.0.0.1 --port 8080 --no-access-log
+fi
