@@ -139,8 +139,8 @@ def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
         x_rot, x_pass = x, None
 
     # Gather cos/sin at positions: [seq_len, rope_dim] → [1, 1, seq_len, rope_dim]
-    c = cos[pos].unsqueeze(0).unsqueeze(0)
-    s = sin[pos].unsqueeze(0).unsqueeze(0)
+    c = cos[pos].unsqueeze(0).unsqueeze(0).to(x.dtype)
+    s = sin[pos].unsqueeze(0).unsqueeze(0).to(x.dtype)
 
     x_rot = x_rot * c + _rotate_half(x_rot) * s
 
