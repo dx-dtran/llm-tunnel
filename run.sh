@@ -15,6 +15,10 @@ declare -A MODELS=(
     ["gemma4-26b-fp8"]="protoLabsAI/gemma-4-26B-A4B-it-FP8"
     # NVFP4: NVIDIA Model Optimizer quant, requires Hopper/Blackwell GPU
     ["gemma4-31b-nvfp4"]="nvidia/Gemma-4-31B-IT-NVFP4"
+    # FP8: vLLM-team quant (best quality), needs A100/H100 80 GB
+    ["gemma4-31b-fp8"]="RedHatAI/gemma-4-31B-it-FP8-block"
+    # AWQ 4-bit: fits on 24 GB consumer GPU
+    ["gemma4-31b-awq"]="cyankiwi/gemma-4-31B-it-AWQ-4bit"
     # GPT-OSS — natively MXFP4 quantized (vLLM auto-detects, no extra flags needed)
     ["gpt-oss-20b"]="openai/gpt-oss-20b"
     ["gpt-oss-120b"]="openai/gpt-oss-120b"
