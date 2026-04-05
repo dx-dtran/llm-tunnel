@@ -38,7 +38,7 @@ class Gemma4Config:
     partial_rotary_factor: float = 0.25    # full attention only
     sliding_window: int = 1024
     max_position_embeddings: int = 262144
-    final_logit_softcapping: float = 30.0
+    final_logit_softcapping: Optional[float] = None
     attention_k_eq_v: bool = True
     layer_types: list = field(
         default_factory=lambda: (["sliding_attention"] * 5 + ["full_attention"]) * 10
@@ -66,7 +66,7 @@ class Gemma4Config:
             partial_rotary_factor=rp.get("full_attention", {}).get("partial_rotary_factor", 0.25),
             sliding_window=tc.get("sliding_window", 1024),
             max_position_embeddings=tc.get("max_position_embeddings", 262144),
-            final_logit_softcapping=tc.get("final_logit_softcapping", 30.0),
+            final_logit_softcapping=tc.get("final_logit_softcapping"),
             attention_k_eq_v=tc.get("attention_k_eq_v", True),
             layer_types=tc.get(
                 "layer_types",
@@ -351,9 +351,10 @@ class Gemma4Model(nn.Module):
         # Tied output projection
         logits = F.linear(x, self.embed_tokens.weight)
 
-        # Logit softcapping
+        # Logit softcapping (only if configured)
         cap = self.config.final_logit_softcapping
-        logits = torch.tanh(logits / cap) * cap
+        if cap is not None:
+            logits = torch.tanh(logits / cap) * cap
 
         return logits
 
