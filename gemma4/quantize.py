@@ -368,6 +368,7 @@ def quantize(
 
     checkpoint = torch.load(str(checkpoint_path), mmap=True, weights_only=True)
     model.load_state_dict(checkpoint, assign=True)
+    del checkpoint
     model = model.to(dtype=precision, device=device)
 
     if mode == "int8":
@@ -398,9 +399,16 @@ def quantize(
         )
 
     quantize_path = dir_name / new_base_name
-    # Delete the source checkpoint to free disk space before saving
+    # Free disk: model.to() already copied weights to new tensors,
+    # so mmap references from the original load should be dead.
+    import gc
+    gc.collect()
     print(f"Removing {checkpoint_path} to free disk space ...")
-    checkpoint_path.unlink(missing_ok=True)
+    checkpoint_path.unlink()
+    # Verify it's actually freed
+    import shutil
+    free_gb = shutil.disk_usage(dir_name).free / 1e9
+    print(f"Free disk space: {free_gb:.1f} GB")
     print(f"Writing quantized weights to {quantize_path}")
     quantize_path.unlink(missing_ok=True)
     torch.save(quantized_state_dict, quantize_path)
