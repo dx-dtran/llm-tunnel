@@ -80,20 +80,20 @@ class Gemma4Config:
 # ═══════════════════════════════════════════════════════════════════════
 
 class RMSNorm(nn.Module):
-    """Gemma 4 RMSNorm — weight initialized to ones, no +1 offset."""
+    """Gemma RMSNorm — weights stored as zeros-centered, +1 added at runtime."""
 
     def __init__(self, dim: int, eps: float = 1e-6, with_scale: bool = True):
         super().__init__()
         self.eps = eps
         self.with_scale = with_scale
         if with_scale:
-            self.weight = nn.Parameter(torch.ones(dim))
+            self.weight = nn.Parameter(torch.zeros(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x_float = x.float()
         normed = x_float * torch.rsqrt(x_float.pow(2).mean(-1, keepdim=True) + self.eps)
         if self.with_scale:
-            normed = normed * self.weight.float()
+            normed = normed * (1.0 + self.weight.float())
         return normed.type_as(x)
 
 
