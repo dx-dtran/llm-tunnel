@@ -29,7 +29,7 @@ default_device = "cuda" if torch.cuda.is_available() else "cpu"
 wd = Path(__file__).parent.parent.resolve()
 sys.path.append(str(wd))
 
-from sentencepiece import SentencePieceProcessor
+from tokenizers import Tokenizer
 
 from model import Transformer
 
@@ -148,9 +148,10 @@ def generate(
 
 
 def encode_tokens(tokenizer, string, bos=True, device="cuda"):
-    tokens = tokenizer.encode(string)
+    tokens = tokenizer.encode(string, add_special_tokens=False).ids
     if bos:
-        tokens = [tokenizer.bos_id()] + tokens
+        bos_id = tokenizer.token_to_id("<bos>")
+        tokens = [bos_id] + tokens
     return torch.tensor(tokens, dtype=torch.int, device=device)
 
 
@@ -222,7 +223,7 @@ def main(
     """Generates text samples based on a pre-trained Gemma 4 model and tokenizer."""
     assert checkpoint_path.is_file(), checkpoint_path
 
-    tokenizer_path = checkpoint_path.parent / "tokenizer.model"
+    tokenizer_path = checkpoint_path.parent / "tokenizer.json"
     assert tokenizer_path.is_file(), str(tokenizer_path)
 
     global print
@@ -244,7 +245,7 @@ def main(
     device_sync(device=device)
     print(f"Time to load model: {time.time() - t0:.02f} seconds")
 
-    tokenizer = SentencePieceProcessor(model_file=str(tokenizer_path))
+    tokenizer = Tokenizer.from_file(str(tokenizer_path))
     encoded = encode_tokens(tokenizer, prompt, bos=True, device=device)
     prompt_length = encoded.size(0)
 
@@ -272,23 +273,18 @@ def main(
             prompt = input("What is your prompt? ")
             encoded = encode_tokens(tokenizer, prompt, bos=True, device=device)
 
-        if interactive and i >= 0:
-            buffer = []
-            period_id = tokenizer.encode(".")[0]
-            done_generating = False
+        eos_id = tokenizer.token_to_id("<eos>")
+        done_generating = False
 
-            def callback(x):
-                nonlocal done_generating
-                if done_generating:
-                    return
-                buffer.append(tokenizer.decode([period_id] + x.tolist())[1:])
-                if x.item() == tokenizer.eos_id():
-                    done_generating = True
-                if len(buffer) == 4 or done_generating:
-                    print("".join(buffer), end="", flush=True)
-                    buffer.clear()
-        else:
-            callback = lambda x: x
+        def callback(x):
+            nonlocal done_generating
+            if done_generating:
+                return
+            token_id = x.item()
+            if token_id == eos_id:
+                done_generating = True
+                return
+            print(tokenizer.decode([token_id]), end="", flush=True)
 
         t0 = time.perf_counter()
         import contextlib
@@ -319,10 +315,7 @@ def main(
         device_sync(device=device)
         t = time.perf_counter() - t0
 
-        if not interactive:
-            print(tokenizer.decode(y.tolist()))
-        else:
-            print()
+        print()
         tokens_generated = y.size(0) - prompt_length
         tokens_sec = tokens_generated / t
         aggregate_metrics["tokens_per_sec"].append(tokens_sec)

@@ -5,3 +5,7 @@ huggingface_hub
 transformers
 fastapi
 uvicorn
+
+sentencepiece
+tiktoken
+blobfile
