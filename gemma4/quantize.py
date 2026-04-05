@@ -9,6 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from model import Transformer, find_multiple
+from convert_hf_checkpoint import convert_hf_checkpoint
 
 ##### Quantization Primitives ######
 
@@ -349,27 +350,40 @@ class WeightOnlyInt4Linear(torch.nn.Module):
 
 
 def quantize(
-    checkpoint_path: Path = Path("checkpoints/google/gemma-4-31B-it/model.pth"),
+    checkpoint_path: Optional[Path] = None,
     mode: str = "int8",
     groupsize: int = 128,
     label: str = "",
     model_name: Optional[str] = None,
+    checkpoint_dir: Optional[Path] = None,
 ) -> None:
-    assert checkpoint_path.is_file(), checkpoint_path
-
     device = "cpu"
     precision = torch.bfloat16
-
-    print("Loading model ...")
     t0 = time.time()
 
-    with torch.device("meta"):
-        model = Transformer.from_name(model_name or checkpoint_path.parent.name)
-
-    checkpoint = torch.load(str(checkpoint_path), mmap=True, weights_only=True)
-    model.load_state_dict(checkpoint, assign=True)
-    del checkpoint
-    model = model.to(dtype=precision, device=device)
+    if checkpoint_dir is not None:
+        # Convert from safetensors directly in memory (no intermediate model.pth)
+        assert model_name is not None, "--model_name required when using --checkpoint_dir"
+        print("Converting from safetensors + loading model ...")
+        state_dict = convert_hf_checkpoint(
+            checkpoint_dir=checkpoint_dir, model_name=model_name, save=False
+        )
+        with torch.device("meta"):
+            model = Transformer.from_name(model_name)
+        model.load_state_dict(state_dict, assign=True)
+        del state_dict
+        model = model.to(dtype=precision, device=device)
+        output_dir = checkpoint_dir
+    else:
+        assert checkpoint_path is not None and checkpoint_path.is_file(), checkpoint_path
+        print("Loading model ...")
+        with torch.device("meta"):
+            model = Transformer.from_name(model_name or checkpoint_path.parent.name)
+        checkpoint = torch.load(str(checkpoint_path), mmap=True, weights_only=True)
+        model.load_state_dict(checkpoint, assign=True)
+        del checkpoint
+        model = model.to(dtype=precision, device=device)
+        output_dir = checkpoint_path.parent
 
     if mode == "int8":
         print(
@@ -377,10 +391,7 @@ def quantize(
         )
         quant_handler = WeightOnlyInt8QuantHandler(model)
         quantized_state_dict = quant_handler.create_quantized_state_dict()
-
-        dir_name = checkpoint_path.parent
-        base_name = checkpoint_path.name
-        new_base_name = base_name.replace(".pth", f"{label}int8.pth")
+        new_base_name = f"model{label}int8.pth"
 
     elif mode == "int4":
         print(
@@ -388,27 +399,16 @@ def quantize(
         )
         quant_handler = WeightOnlyInt4QuantHandler(model, groupsize)
         quantized_state_dict = quant_handler.create_quantized_state_dict()
-
-        dir_name = checkpoint_path.parent
-        base_name = checkpoint_path.name
-        new_base_name = base_name.replace(".pth", f"{label}int4.g{groupsize}.pth")
+        new_base_name = f"model{label}int4.g{groupsize}.pth"
 
     else:
         raise ValueError(
             f"Invalid quantization mode {mode} needs to be one of [int8, int4]"
         )
 
-    quantize_path = dir_name / new_base_name
-    # Free disk: model.to() already copied weights to new tensors,
-    # so mmap references from the original load should be dead.
-    import gc
-    gc.collect()
-    print(f"Removing {checkpoint_path} to free disk space ...")
-    checkpoint_path.unlink()
-    # Verify it's actually freed
-    import shutil
-    free_gb = shutil.disk_usage(dir_name).free / 1e9
-    print(f"Free disk space: {free_gb:.1f} GB")
+    del model
+
+    quantize_path = output_dir / new_base_name
     print(f"Writing quantized weights to {quantize_path}")
     quantize_path.unlink(missing_ok=True)
     torch.save(quantized_state_dict, quantize_path)
@@ -423,8 +423,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--checkpoint_path",
         type=Path,
-        default=Path("checkpoints/google/gemma-4-31B-it/model.pth"),
-        help="Path to the model checkpoint to be quantized.",
+        default=None,
+        help="Path to a converted model.pth checkpoint.",
+    )
+    parser.add_argument(
+        "--checkpoint_dir",
+        type=Path,
+        default=None,
+        help="Path to HF checkpoint dir (safetensors). Converts in memory, no intermediate model.pth needed.",
     )
     parser.add_argument(
         "--mode",
@@ -454,4 +460,11 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
-    quantize(args.checkpoint_path, args.mode, args.groupsize, args.label, args.model_name)
+    quantize(
+        checkpoint_path=args.checkpoint_path,
+        mode=args.mode,
+        groupsize=args.groupsize,
+        label=args.label,
+        model_name=args.model_name,
+        checkpoint_dir=args.checkpoint_dir,
+    )

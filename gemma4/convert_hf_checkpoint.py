@@ -51,7 +51,8 @@ def convert_hf_checkpoint(
     *,
     checkpoint_dir: Path = Path("checkpoints/google/gemma-4-31B-it"),
     model_name: Optional[str] = None,
-) -> None:
+    save: bool = True,
+) -> dict:
     if model_name is None:
         model_name = checkpoint_dir.name
 
@@ -200,9 +201,13 @@ def convert_hf_checkpoint(
             final_result[pre + "wqkv.weight"] = torch.cat([q, k])
 
     print(f"Converted {len(final_result)} weight tensors")
-    print(f"Saving checkpoint to {checkpoint_dir / 'model.pth'}")
-    torch.save(final_result, checkpoint_dir / "model.pth")
-    print("Done!")
+
+    if save:
+        print(f"Saving checkpoint to {checkpoint_dir / 'model.pth'}")
+        torch.save(final_result, checkpoint_dir / "model.pth")
+        print("Done!")
+
+    return final_result
 
 
 if __name__ == "__main__":
