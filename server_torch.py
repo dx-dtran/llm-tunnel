@@ -146,12 +146,17 @@ async def _generate_tokens(prompt_tokens: list[int], max_tokens: int,
 
     def _run():
         token_ids = []
-        for tok in generate(model, prompt_tokens, max_tokens,
-                            temperature=temperature, top_p=top_p):
-            token_ids.append(tok)
-            text = _decode(token_ids)
-            loop.call_soon_threadsafe(queue.put_nowait, (list(token_ids), text))
-        loop.call_soon_threadsafe(queue.put_nowait, None)
+        try:
+            for tok in generate(model, prompt_tokens, max_tokens,
+                                temperature=temperature, top_p=top_p):
+                token_ids.append(tok)
+                text = _decode(token_ids)
+                loop.call_soon_threadsafe(queue.put_nowait, (list(token_ids), text))
+        except Exception:
+            import traceback
+            traceback.print_exc()
+        finally:
+            loop.call_soon_threadsafe(queue.put_nowait, None)
 
     _executor.submit(_run)
 
