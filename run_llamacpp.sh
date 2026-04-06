@@ -19,6 +19,8 @@ declare -A MODELS=(
     ["gpt-oss-20b"]="bartowski/openai_gpt-oss-20b-GGUF|openai_gpt-oss-20b-Q4_K_M.gguf"
     # GPT-OSS 20B — Q5_K_M quantization (~11.7 GB, slightly higher quality)
     ["gpt-oss-20b-q5"]="bartowski/openai_gpt-oss-20b-GGUF|openai_gpt-oss-20b-Q5_K_M.gguf"
+    # GPT-OSS 20B — native MXFP4 (the model's actual training format, highest fidelity, ~12.1 GB)
+    ["gpt-oss-20b-mxfp4"]="ggml-org/gpt-oss-20b-GGUF|gpt-oss-20b-mxfp4.gguf"
 )
 
 if [ -z "$1" ] || [ -z "${MODELS[$1]+x}" ]; then
