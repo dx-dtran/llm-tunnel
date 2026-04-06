@@ -102,8 +102,14 @@ def _build_prompt_tokens(chat: list[dict]) -> list[int]:
     """Apply chat template and tokenize."""
     merged = _merge_consecutive(chat)
     if tokenizer.chat_template:
-        text = tokenizer.apply_chat_template(merged, tokenize=False,
-                                              add_generation_prompt=True)
+        kwargs = dict(tokenize=False, add_generation_prompt=True)
+        # Activate Gemma 4 thinking mode. The tokenizer prepends <|think|>
+        # (token 98) to the system turn when enable_thinking=True, instructing
+        # the model to emit a <|channel>thought\n...<channel|> block.
+        try:
+            text = tokenizer.apply_chat_template(merged, enable_thinking=True, **kwargs)
+        except TypeError:
+            text = tokenizer.apply_chat_template(merged, **kwargs)
     else:
         parts = []
         for m in merged:
@@ -118,12 +124,22 @@ def _decode(token_ids: list[int]) -> str:
     return tokenizer.decode(token_ids, skip_special_tokens=False)
 
 
-_THINK_OPEN = "<think>"
-_THINK_CLOSE = "</think>"
+# Gemma 4 channel format.
+# <|channel> (token 100) and <channel|> (token 101) are special vocabulary
+# tokens. _decode() uses skip_special_tokens=False so they appear in the text.
+_THINK_OPEN = "<|channel>thought\n"
+_THINK_CLOSE = "<channel|>"
 _THINK_OPEN_LEN = len(_THINK_OPEN)
 
 
 def _parse_thinking(text: str) -> tuple[str, str, bool]:
+    """Split Gemma 4 output into (thinking, response, is_still_thinking).
+
+    Gemma 4 wraps its chain-of-thought in a 'thought' channel block:
+        <|channel>thought\\n...reasoning...<channel|>\\n...response...
+    The opening and closing markers are actual special tokens (IDs 100/101),
+    preserved in the decoded text because _decode() sets skip_special_tokens=False.
+    """
     if not text.startswith(_THINK_OPEN):
         return ("", text, False)
     end_idx = text.find(_THINK_CLOSE)
