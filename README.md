@@ -31,7 +31,94 @@ curl -s http://localhost:8080/v1/chat/completions \
 
 ---
 
-## Vast.ai setup
+## Vast.ai setup — llama.cpp (recommended for Gemma 4 31B)
+
+Native llama.cpp is the simplest way to run Gemma 4 31B on Vast.ai. It builds directly against CUDA, serves a built-in chat UI, and exposes an OpenAI-compatible API — no Python runtime required.
+
+### 1. Rent a GPU instance
+
+On the Vast.ai console, rent a CUDA instance with at least 24 GB VRAM (RTX 3090/4090, A100, H100, etc.). Note the **SSH port** and **IP address** from the instance dashboard.
+
+### 2. SSH into the instance
+
+```bash
+ssh -p <PORT> root@<IP>
+```
+
+### 3. Build llama.cpp with CUDA
+
+```bash
+apt-get install -y libcurl4-openssl-dev
+git clone https://github.com/ggerganov/llama.cpp
+
+cmake llama.cpp -B /tmp/llama.cpp/build \
+  -DBUILD_SHARED_LIBS=OFF \
+  -DGGML_CUDA=ON \
+  -DLLAMA_CURL=ON
+
+cmake --build /tmp/llama.cpp/build \
+  --config Release -j \
+  --clean-first \
+  --target llama-server llama-cli llama-quantize llama-gguf-split
+```
+
+Build takes ~5–10 minutes. The server binary ends up at `/tmp/llama.cpp/build/bin/llama-server`.
+
+### 4. Download the model
+
+```bash
+mkdir -p ~/models
+wget -c -O ~/models/gemma-4-31B-it-Q4_K_M.gguf \
+  "https://huggingface.co/ggml-org/gemma-4-31B-it-GGUF/resolve/main/gemma-4-31B-it-Q4_K_M.gguf"
+```
+
+`-c` resumes an interrupted download — safe to re-run if the connection drops.
+
+**Available quantizations** (same URL pattern, swap the filename):
+
+| File | Size | VRAM | Notes |
+|------|------|------|-------|
+| `gemma-4-31B-it-Q4_K_M.gguf` | 17.4 GB | 24 GB | fits RTX 3090/4090 |
+| `gemma-4-31B-it-Q8_0.gguf` | 30.4 GB | ~34 GB | higher quality |
+| `gemma-4-31B-it-f16.gguf` | 57.2 GB | ~64 GB | full precision |
+| `mmproj-gemma-4-31B-it-f16.gguf` | 1.1 GB | — | vision projector (optional) |
+
+Add `--mmproj ~/models/mmproj-gemma-4-31B-it-f16.gguf` to the `llama-server` command to enable image input.
+
+### 5. Run the server
+
+```bash
+fuser -k 8080/tcp 2>/dev/null; sleep 1
+
+/tmp/llama.cpp/build/bin/llama-server \
+  -m ~/models/gemma-4-31B-it-Q4_K_M.gguf \
+  --host 127.0.0.1 \
+  --port 8080 \
+  -ngl 99 \
+  --jinja \
+  -c 16384
+```
+
+`-ngl 99` offloads all layers to GPU. `--jinja` enables the model's native chat template (important for correct Gemma 4 formatting). `-c 0` uses the model's maximum context length. The server binds to `127.0.0.1` only — not reachable from the public internet, only via the SSH tunnel.
+
+### 6. Open the SSH tunnel (on your local machine)
+
+In a separate terminal on your local machine:
+
+```bash
+ssh -L 8080:localhost:8080 -p <PORT> root@<IP>
+```
+
+Keep this terminal open while you use the server. Then:
+
+- **Chat UI:** open `http://localhost:8080` in your browser — llama.cpp's built-in web interface
+- **OpenAI-compatible API:** `http://localhost:8080/v1` — works with Aider, Cline, Continue, etc.
+
+---
+
+## Vast.ai setup — vLLM (for other models)
+
+Use vLLM for models not well-supported by llama.cpp (GPT-OSS, NVFP4, MXFP4, AWQ).
 
 ### 1. Rent a GPU instance
 
@@ -47,9 +134,6 @@ ssh -p <PORT> root@<IP>
 
 ```bash
 pip install -r requirements.txt
-```
-
-```bash
 chmod +x run.sh
 ```
 
@@ -284,14 +368,9 @@ Everything lives in `server.py`:
 - Server binds to `127.0.0.1` only — accessible exclusively through the SSH tunnel
 - No conversation content is stored or logged anywhere
 
-
-```
-python gemma4/convert_hf_checkpoint.py --checkpoint_dir ../.hf_home/hub/models--google--gemma-4-31B-it/snapshots/419b2efe421994fdfd3394e621983d4cc511cd4f --model_name gemma-4-31B-it
-```
-
 ```
 python gemma4/quantize.py \
-  --checkpoint_dir ../.hf_home/hub/models--google--gemma-4-31B-it/snapshots/419b2efe421994fdfd3394e621983d4cc511cd4f/ \
+  --checkpoint_dir /root/.cache/huggingface/hub/models--google--gemma-4-31B-it/snapshots/419b2efe421994fdfd3394e621983d4cc511cd4f \
   --mode int4 --groupsize 128 \
   --model_name gemma-4-31B-it
 
@@ -299,7 +378,7 @@ python gemma4/quantize.py \
 
 ```
 python gemma4/generate.py \
-  --checkpoint_path ../.hf_home/hub/models--google--gemma-4-31B-it/snapshots/419b2efe421994fdfd3394e621983d4cc511cd4f/model_int4.g128.pth \
+  --checkpoint_path /root/.cache/huggingface/hub/models--google--gemma-4-31B-it/snapshots/419b2efe421994fdfd3394e621983d4cc511cd4f/model_int4.g128.pth \
   --model_name gemma-4-31B-it \
   --prompt "Hello, my name is" \
   --max_new_tokens 200
