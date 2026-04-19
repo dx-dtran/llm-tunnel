@@ -13,6 +13,14 @@ declare -A MODELS=(
     ["gemma4-e4b"]="ggml-org/gemma-4-E4B-it-GGUF|gemma-4-E4B-it-Q4_K_M.gguf"
     # Gemma 4 E2B — Q4_K_M quantization (tiny, testing)
     ["gemma4-e2b"]="ggml-org/gemma-4-E2B-it-GGUF|gemma-4-E2B-it-Q4_K_M.gguf"
+    # GPT-OSS 20B — Q4_K_M quantization (~11.7 GB)
+    # Uses harmony format: reasoning in analysis channel, response in final channel.
+    # The native format is MXFP4; K-quants are community re-quantizations.
+    ["gpt-oss-20b"]="bartowski/openai_gpt-oss-20b-GGUF|openai_gpt-oss-20b-Q4_K_M.gguf"
+    # GPT-OSS 20B — Q5_K_M quantization (~11.7 GB, slightly higher quality)
+    ["gpt-oss-20b-q5"]="bartowski/openai_gpt-oss-20b-GGUF|openai_gpt-oss-20b-Q5_K_M.gguf"
+    # GPT-OSS 20B — native MXFP4 (the model's actual training format, highest fidelity, ~12.1 GB)
+    ["gpt-oss-20b-mxfp4"]="ggml-org/gpt-oss-20b-GGUF|gpt-oss-20b-mxfp4.gguf"
 )
 
 if [ -z "$1" ] || [ -z "${MODELS[$1]+x}" ]; then

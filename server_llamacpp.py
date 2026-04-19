@@ -2,6 +2,7 @@ import os
 import json
 import uuid
 import time
+from dataclasses import dataclass
 
 # Disable telemetry before importing anything else
 os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
@@ -31,9 +32,61 @@ async def _suppress_traceback(_: Request, exc: Exception) -> JSONResponse:
 llm: Llama = None
 
 
+# ---------- model-specific thinking format ----------
+
+@dataclass(frozen=True)
+class _ThinkFmt:
+    """Describes how a model encodes its reasoning block in raw output."""
+    open: str         # text that opens the thinking block
+    close: str        # text that closes the thinking block
+    resp: str | None  # text that introduces the response channel (harmony only); None = response follows directly after close
+    think_token: str | None  # token to prepend to the system message to activate thinking (Gemma 4 only)
+
+
+# <think>...</think> — QwQ, DeepSeek-R1, Qwen3, etc.
+_THINK_TAG = _ThinkFmt(
+    open="<think>",
+    close="</think>",
+    resp=None,
+    think_token=None,
+)
+
+# Gemma 4 channel format: <|channel>thought\n...<channel|>
+# Thinking is opt-in: prepend <|think|> (token 98) to the system message content.
+_GEMMA4_CH = _ThinkFmt(
+    open="<|channel>thought\n",
+    close="<channel|>",
+    resp=None,
+    think_token="<|think|>",
+)
+
+# GPT-OSS harmony format: multi-channel output with dedicated analysis and final channels.
+# All markers are special tokens in the o200k_harmony vocabulary.
+_HARMONY = _ThinkFmt(
+    open="<|channel|>analysis<|message|>",
+    close="<|end|>",
+    resp="<|channel|>final<|message|>",
+    think_token=None,
+)
+
+
+def _get_think_fmt(model_id: str) -> _ThinkFmt:
+    lower = model_id.lower()
+    if "gpt-oss" in lower:
+        return _HARMONY
+    if "gemma-4" in lower or "gemma4" in lower:
+        return _GEMMA4_CH
+    return _THINK_TAG
+
+
+_think_fmt: _ThinkFmt = _THINK_TAG  # replaced at startup
+
+
 @app.on_event("startup")
 async def load_model():
-    global llm
+    global llm, _think_fmt
+
+    _think_fmt = _get_think_fmt(MODEL_ID)
 
     print(f"Downloading {MODEL_FILE} from {MODEL_ID} ...")
     model_path = hf_hub_download(
@@ -105,36 +158,68 @@ def _merge_consecutive(chat: list[dict]) -> list[dict]:
 
 def _build_messages(chat: list[dict]) -> list[dict]:
     """Build a messages list for llama-cpp-python's chat completion."""
-    return _merge_consecutive(chat)
+    messages = _merge_consecutive(chat)
 
+    if _think_fmt.think_token is None:
+        return messages
 
-_THINK_OPEN = "<think>"
-_THINK_CLOSE = "</think>"
-_THINK_OPEN_LEN = len(_THINK_OPEN)
+    # Gemma 4: activate thinking mode by prepending <|think|> to the system
+    # message content. llama.cpp encodes this as the actual special token (ID 98),
+    # which instructs the model to emit a <|channel>thought\n...<channel|> block.
+    messages = list(messages)  # shallow copy before mutating
+    for i, msg in enumerate(messages):
+        if msg["role"] == "system":
+            messages[i] = {**msg, "content": _think_fmt.think_token + msg["content"]}
+            return messages
+    # No system message present — add a minimal one with just the think token.
+    return [{"role": "system", "content": _think_fmt.think_token}] + messages
 
 
 def _parse_thinking(text: str) -> tuple[str, str, bool]:
-    """Split cumulative model output into (thinking, response, is_still_thinking).
+    """Split raw model output into (thinking, response, is_still_thinking).
 
-    Only detects <think> at position 0 (how all reasoning models behave).
+    Handles three distinct formats determined by the loaded model:
+
+    • <think>…</think>  — QwQ, DeepSeek-R1, Qwen3 (plain text markers)
+    • <|channel>thought\\n…<channel|>  — Gemma 4 (special vocab tokens 100/101)
+    • <|channel|>analysis<|message|>…<|end|> … <|channel|>final<|message|>…
+                        — GPT-OSS harmony format (o200k_harmony special tokens)
     """
-    if not text.startswith(_THINK_OPEN):
+    fmt = _think_fmt
+
+    if not text.startswith(fmt.open):
+        if fmt.resp is not None:
+            # Harmony: response lives in the 'final' channel.
+            resp_idx = text.find(fmt.resp)
+            if resp_idx == -1:
+                return ("", "", False)
+            return ("", text[resp_idx + len(fmt.resp):], False)
         return ("", text, False)
 
-    end_idx = text.find(_THINK_CLOSE)
-    if end_idx == -1:
-        return (text[_THINK_OPEN_LEN:], "", True)
+    close_idx = text.find(fmt.close)
+    if close_idx == -1:
+        return (text[len(fmt.open):], "", True)
 
-    thinking = text[_THINK_OPEN_LEN:end_idx]
-    response = text[end_idx + len(_THINK_CLOSE):]
-    if response.startswith("\n"):
-        response = response[1:]
+    thinking = text[len(fmt.open):close_idx]
+    after_close = text[close_idx + len(fmt.close):]
+
+    if fmt.resp is not None:
+        resp_idx = after_close.find(fmt.resp)
+        if resp_idx == -1:
+            # Analysis finished; final channel header not yet in the stream.
+            return (thinking, "", False)
+        response = after_close[resp_idx + len(fmt.resp):]
+    else:
+        response = after_close
+        if response.startswith("\n"):
+            response = response[1:]
+
     return (thinking, response, False)
 
 
 def _generate(messages: list[dict], max_tokens: int, temperature: float, top_p: float | None):
     """Non-streaming generation. Returns (text, input_tokens, output_tokens)."""
-    kwargs = dict(
+    kwargs: dict = dict(
         messages=messages,
         max_tokens=max_tokens,
         temperature=temperature,
@@ -150,8 +235,8 @@ def _generate(messages: list[dict], max_tokens: int, temperature: float, top_p: 
 
 
 def _generate_stream(messages: list[dict], max_tokens: int, temperature: float, top_p: float | None):
-    """Streaming generation. Yields (delta_text, None) per chunk, then (None, usage) at end."""
-    kwargs = dict(
+    """Streaming generation. Yields delta text strings."""
+    kwargs: dict = dict(
         messages=messages,
         max_tokens=max_tokens,
         temperature=temperature,
@@ -218,6 +303,7 @@ async def messages(req: MessagesRequest):
 
 async def _anthropic_stream(messages_list: list[dict], max_tokens: int, temperature: float, top_p: float | None, model_name: str):
     msg_id = f"msg_{uuid.uuid4().hex[:24]}"
+    open_len = len(_think_fmt.open)
 
     def sse(event: str, data: dict) -> str:
         return f"event: {event}\ndata: {json.dumps(data)}\n\n"
@@ -244,9 +330,9 @@ async def _anthropic_stream(messages_list: list[dict], max_tokens: int, temperat
         output_tokens += 1  # approximate
 
         if phase == "buffering":
-            if len(full_text) < _THINK_OPEN_LEN:
+            if len(full_text) < open_len:
                 continue
-            if full_text.startswith(_THINK_OPEN):
+            if full_text.startswith(_think_fmt.open):
                 phase = "thinking"
                 yield sse("content_block_start", {"type": "content_block_start", "index": 0,
                            "content_block": {"type": "thinking", "thinking": ""}})
@@ -329,6 +415,7 @@ async def chat_completions(req: ChatRequest):
 async def _oai_stream(messages_list: list[dict], max_tokens: int, temperature: float, top_p: float | None, model_name: str):
     msg_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     created = int(time.time())
+    open_len = len(_think_fmt.open)
 
     def sse(data: dict) -> str:
         return f"data: {json.dumps(data)}\n\n"
@@ -348,9 +435,9 @@ async def _oai_stream(messages_list: list[dict], max_tokens: int, temperature: f
         full_text += delta
 
         if phase == "buffering":
-            if len(full_text) < _THINK_OPEN_LEN:
+            if len(full_text) < open_len:
                 continue
-            phase = "thinking" if full_text.startswith(_THINK_OPEN) else "responding"
+            phase = "thinking" if full_text.startswith(_think_fmt.open) else "responding"
 
         if phase == "thinking":
             thinking, response, still = _parse_thinking(full_text)
