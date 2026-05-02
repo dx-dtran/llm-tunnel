@@ -1,2 +1,13 @@
-.idea
-__pycache__
+config.env
+logs/*
+!logs/.gitkeep
+run/*
+!run/.gitkeep
+bin/*
+!bin/.gitkeep
+models/*
+!models/.gitkeep
+*.gguf
+*.safetensors
+*.bin
+.DS_Store
