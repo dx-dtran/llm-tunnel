@@ -7,95 +7,109 @@ Everything mutable lives inside this repo: binaries in `bin/`, models in `models
 ## Layout
 
 ```
-llm                  the only script. up | down | status
-config.example.env   committed template
-config.env           your local config (gitignored, holds secrets)
+llm                  the only script: up | down | status
+config.env           your local config (gitignored)
 bin/                 llama-server, cloudflared (gitignored)
-models/              your GGUF (gitignored)
+models/              your GGUF model (gitignored)
 logs/                process logs (gitignored)
-run/                 PID files (gitignored)
 ```
 
 ## Install (once)
 
-1. Get the binaries. Pick the latest macOS arm64 builds from each project's GitHub releases.
+### 1. Build llama-server
 
-   ```sh
-   # llama-server: https://github.com/ggml-org/llama.cpp/releases (look for llama-bXXXX-bin-macos-arm64.zip)
-   # unzip, copy the llama-server binary into ./bin/
-   chmod +x ./bin/llama-server
+Requires Xcode Command Line Tools (`xcode-select --install`).
 
-   # cloudflared: https://github.com/cloudflare/cloudflared/releases (cloudflared-darwin-arm64.tgz)
-   # untar, copy the cloudflared binary into ./bin/
-   chmod +x ./bin/cloudflared
-   ```
+```sh
+git clone https://github.com/ggml-org/llama.cpp
+cd llama.cpp
+cmake -B build -DLLAMA_METAL=ON
+cmake --build build --config Release -j$(sysctl -n hw.logicalcpu)
+cp build/bin/llama-server /path/to/llm-tunnel/bin/
+```
 
-   On first run macOS may quarantine the binaries — right-click → Open once, or `xattr -d com.apple.quarantine ./bin/llama-server ./bin/cloudflared`.
+### 2. Add a model
 
-2. Drop a GGUF model at `./models/model.gguf` (or change `LLM_MODEL` in `config.env`).
+Drop a GGUF file at `./models/model.gguf` (or change `LLM_MODEL` in `config.env`).
 
-3. Copy the config template:
+### 3. Copy the config template
 
-   ```sh
-   cp config.example.env config.env
-   ```
+```sh
+cp config.example.env config.env
+```
 
-   Edit `config.env` if needed. It is gitignored, so any secrets you put in it stay local.
+### 4. (Optional) Build cloudflared
+
+Only needed if you want to share the server over the internet.
+
+```sh
+git clone https://github.com/cloudflare/cloudflared
+cd cloudflared
+make cloudflared
+cp cloudflared /path/to/llm-tunnel/bin/
+```
+
+On first run macOS may quarantine binaries — clear with:
+
+```sh
+xattr -d com.atlanta.quarantine ./bin/llama-server ./bin/cloudflared
+```
 
 ## Use
 
 ```sh
-./llm up       # start (and start cloudflared if a token is set)
-./llm status   # see what's running, hit /health
+./llm up       # start server (and tunnel if configured)
+./llm status   # check what's running
 ./llm down     # stop everything
 ```
 
-The server runs in the background with `nohup` — closing the terminal won't kill it. A reboot will, since nothing is installed as a login service. To restart: `./llm down && ./llm up`.
+The server runs in the background. Closing the terminal won't kill it; a reboot will.
 
-Default URL: <http://127.0.0.1:8080>
+Default local URL: `http://127.0.0.1:8080`
+
+**Note:** Large models take 30–60 seconds to load after `./llm up`. If you get errors immediately after starting, wait a minute and try again.
+
+## Sharing over the internet
+
+Put `bin/cloudflared` in place (see Install step 4), then run `./llm up`. Since `CLOUDFLARE_TUNNEL_TOKEN` is empty in `config.env`, it starts a **quick tunnel** and prints a public URL:
+
+```
+public: https://broad-wolf-abc123.trycloudflare.com
+```
+
+Share that URL. Anyone with it can use your model — **there is no auth**. The URL changes every time you restart.
+
+To share settings with someone:
+
+```
+Base URL:  https://broad-wolf-abc123.trycloudflare.com/v1
+API key:   local   (any non-empty string works)
+```
+
+### LAN access only
+
+Set `LLM_HOST="0.0.0.0"` in `config.env`. Other devices on your network can reach `http://<your-mac-lan-ip>:8080`. No tunnel needed.
+
+### Named tunnel (stable URL, requires a domain)
+
+If you have a domain on Cloudflare: go to **Zero Trust → Networks → Tunnels → Create a tunnel**, copy the token, and paste it into `config.env`:
+
+```sh
+CLOUDFLARE_TUNNEL_TOKEN="eyJ..."
+```
+
+Then add a public hostname in the dashboard pointing to `localhost:8080`. `./llm up` will start cloudflared with the named tunnel automatically.
+
+To add a login wall so only specific people can access your URL, set up **Cloudflare Access**: go to **Zero Trust → Access → Applications → Add → Self-hosted**, enter your tunnel hostname, and add a policy with the email addresses you want to allow. Visitors will be sent a one-time code to their email before they can get through.
 
 ## Coding agents
 
-`llama-server` exposes OpenAI-compatible endpoints at `/v1`. For tools that accept a custom base URL:
+`llama-server` exposes OpenAI-compatible endpoints at `/v1`:
 
 ```sh
-export OPENAI_BASE_URL="http://127.0.0.1:8080/v1"
+export OPENAI_BASE_URL="http://127.0.0.1:8080/v1"  # or your tunnel URL
 export OPENAI_API_KEY="local"
 ```
-
-Agent workloads are long-context and memory-heavy — consider `LLAMA_PARALLEL=1` and a bigger `LLAMA_CONTEXT` in `config.env`. Compatibility depends on whether the agent honors `OPENAI_BASE_URL` and whether your model has a sane chat template.
-
-## LAN access
-
-Set `LLM_HOST="0.0.0.0"` in `config.env` and `./llm up` again. Other devices on your network can hit `http://<your-mac-lan-ip>:8080`. Trusted networks only — there's no auth.
-
-Find your LAN IP: `ipconfig getifaddr en0` (or `en1`).
-
-## Cloudflare share (named tunnel)
-
-For a stable URL friends can use:
-
-1. In the Cloudflare Zero Trust dashboard, create a tunnel and copy the connector token.
-2. Paste it into `config.env`:
-
-   ```sh
-   CLOUDFLARE_TUNNEL_TOKEN="eyJ..."
-   ```
-
-3. In the tunnel's "Public Hostnames" config, point it at `http://localhost:8080`.
-4. `./llm up` — `cloudflared` starts alongside `llama-server`.
-
-`config.env` is gitignored, so the token never ends up in git.
-
-## Temporary URL (Quick Tunnel)
-
-If you just want a random throwaway URL right now:
-
-```sh
-./bin/cloudflared tunnel --url http://127.0.0.1:8080
-```
-
-This runs in the foreground and prints a `*.trycloudflare.com` URL. Random per-run, not for long-term use.
 
 ## Logs
 
@@ -105,6 +119,4 @@ tail -f logs/*.log
 
 ## Privacy
 
-Prompts are processed on this Mac by `llama-server`. There is no database and no chat history; the only on-disk state is process logs in `logs/` (which don't include request bodies unless `llama-server` is started with debug flags). When you expose the server via LAN or Cloudflare, anyone who can reach the URL can use the model — there's no auth at the `llama-server` layer.
-
-Reasonable thing to tell a friend: *"Your prompts are processed on my Mac. No chat history is saved. The shared link is gated by Cloudflare."*
+Prompts are processed locally by `llama-server` on this Mac. No chat history is saved. When you share via LAN or quick tunnel, anyone who can reach the URL can use the model — there is no auth unless you set up Cloudflare Access (requires a domain).

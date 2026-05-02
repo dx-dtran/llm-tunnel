@@ -74,24 +74,39 @@ cmd_up() {
       2>"$LOG_DIR/llama-server.err.log" &
     echo $! >"$LLAMA_PID_FILE"
     disown || true
-    echo "llama-server started (pid $(cat "$LLAMA_PID_FILE"))"
+    echo "llama-server started (pid $(cat "$LLAMA_PID_FILE")) — loading model, may take 30–60s"
   fi
 
-  if [ -n "${CLOUDFLARE_TUNNEL_TOKEN:-}" ]; then
+  if [ -x "${CLOUDFLARED_BIN:-}" ]; then
     if pid_alive "$CF_PID_FILE"; then
       echo "cloudflared already running (pid $(cat "$CF_PID_FILE"))"
-    else
-      if [ ! -x "$CLOUDFLARED_BIN" ]; then
-        echo "missing $CLOUDFLARED_BIN — see README.md for install" >&2
-        exit 1
-      fi
+    elif [ -n "${CLOUDFLARE_TUNNEL_TOKEN:-}" ]; then
       nohup "$CLOUDFLARED_BIN" tunnel --no-autoupdate run \
         --token "$CLOUDFLARE_TUNNEL_TOKEN" \
         >"$LOG_DIR/cloudflared.log" \
         2>"$LOG_DIR/cloudflared.err.log" &
       echo $! >"$CF_PID_FILE"
       disown || true
-      echo "cloudflared started (pid $(cat "$CF_PID_FILE"))"
+      echo "cloudflared started (named tunnel, pid $(cat "$CF_PID_FILE"))"
+    else
+      nohup "$CLOUDFLARED_BIN" tunnel --no-autoupdate \
+        --url "http://127.0.0.1:$LLM_PORT" \
+        >"$LOG_DIR/cloudflared.log" \
+        2>&1 &
+      echo $! >"$CF_PID_FILE"
+      disown || true
+      echo "cloudflared started (quick tunnel, pid $(cat "$CF_PID_FILE"))"
+      echo "waiting for quick tunnel URL..."
+      for _ in $(seq 1 20); do
+        url="$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' "$LOG_DIR/cloudflared.log" 2>/dev/null | head -1 || true)"
+        [ -n "$url" ] && break
+        sleep 1
+      done
+      if [ -n "$url" ]; then
+        echo "public: $url"
+      else
+        echo "tunnel URL not found yet — check logs/cloudflared.log"
+      fi
     fi
   fi
 
@@ -110,11 +125,22 @@ cmd_status() {
     echo "llama-server: stopped"
   fi
   if pid_alive "$CF_PID_FILE"; then
-    echo "cloudflared:  running (pid $(cat "$CF_PID_FILE"))"
+    if [ -n "${CLOUDFLARE_TUNNEL_TOKEN:-}" ]; then
+      echo "cloudflared:  running named tunnel (pid $(cat "$CF_PID_FILE"))"
+    else
+      url="$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' "$LOG_DIR/cloudflared.log" "$LOG_DIR/cloudflared.err.log" 2>/dev/null | head -1 || true)"
+      if [ -n "$url" ]; then
+        echo "cloudflared:  running quick tunnel (pid $(cat "$CF_PID_FILE")) → $url"
+      else
+        echo "cloudflared:  running quick tunnel (pid $(cat "$CF_PID_FILE"))"
+      fi
+    fi
   elif [ -n "${CLOUDFLARE_TUNNEL_TOKEN:-}" ]; then
     echo "cloudflared:  stopped (token set in config.env)"
+  elif [ -x "${CLOUDFLARED_BIN:-}" ]; then
+    echo "cloudflared:  stopped (run ./llm up to start quick tunnel)"
   else
-    echo "cloudflared:  off (no token in config.env)"
+    echo "cloudflared:  off (no cloudflared binary in bin/)"
   fi
 
   if command -v curl >/dev/null 2>&1; then
