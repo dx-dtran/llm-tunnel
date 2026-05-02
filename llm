@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+set -eu
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$REPO"
+
+if [ -f "$REPO/config.env" ]; then
+  # shellcheck disable=SC1091
+  . "$REPO/config.env"
+elif [ -f "$REPO/config.example.env" ]; then
+  # shellcheck disable=SC1091
+  . "$REPO/config.example.env"
+else
+  echo "no config.env or config.example.env found" >&2
+  exit 1
+fi
+
+mkdir -p "$LOG_DIR" "$RUN_DIR"
+
+LLAMA_PID_FILE="$RUN_DIR/llama-server.pid"
+CF_PID_FILE="$RUN_DIR/cloudflared.pid"
+
+pid_alive() {
+  local f="$1"
+  [ -f "$f" ] || return 1
+  local p
+  p="$(cat "$f" 2>/dev/null || true)"
+  [ -n "$p" ] && kill -0 "$p" 2>/dev/null
+}
+
+stop_pid() {
+  local f="$1" name="$2"
+  if pid_alive "$f"; then
+    local p
+    p="$(cat "$f")"
+    echo "stopping $name ($p)"
+    kill "$p" 2>/dev/null || true
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      kill -0 "$p" 2>/dev/null || break
+      sleep 0.3
+    done
+    if kill -0 "$p" 2>/dev/null; then
+      echo "force-killing $name"
+      kill -9 "$p" 2>/dev/null || true
+    fi
+  fi
+  rm -f "$f"
+}
+
+cmd_up() {
+  if pid_alive "$LLAMA_PID_FILE"; then
+    echo "llama-server already running (pid $(cat "$LLAMA_PID_FILE"))"
+  else
+    if [ ! -x "$LLAMA_SERVER_BIN" ]; then
+      echo "missing $LLAMA_SERVER_BIN — see README.md for install" >&2
+      exit 1
+    fi
+    if [ ! -f "$LLM_MODEL" ]; then
+      echo "missing model at $LLM_MODEL — put a GGUF there" >&2
+      exit 1
+    fi
+    if [ "$LLM_HOST" = "0.0.0.0" ]; then
+      echo "WARNING: LLM_HOST=0.0.0.0, server will be reachable on the LAN"
+    fi
+    # shellcheck disable=SC2086
+    nohup "$LLAMA_SERVER_BIN" \
+      -m "$LLM_MODEL" \
+      --host "$LLM_HOST" \
+      --port "$LLM_PORT" \
+      -c "$LLAMA_CONTEXT" \
+      -np "$LLAMA_PARALLEL" \
+      $LLAMA_EXTRA_ARGS \
+      >"$LOG_DIR/llama-server.log" \
+      2>"$LOG_DIR/llama-server.err.log" &
+    echo $! >"$LLAMA_PID_FILE"
+    disown || true
+    echo "llama-server started (pid $(cat "$LLAMA_PID_FILE"))"
+  fi
+
+  if [ -n "${CLOUDFLARE_TUNNEL_TOKEN:-}" ]; then
+    if pid_alive "$CF_PID_FILE"; then
+      echo "cloudflared already running (pid $(cat "$CF_PID_FILE"))"
+    else
+      if [ ! -x "$CLOUDFLARED_BIN" ]; then
+        echo "missing $CLOUDFLARED_BIN — see README.md for install" >&2
+        exit 1
+      fi
+      nohup "$CLOUDFLARED_BIN" tunnel --no-autoupdate run \
+        --token "$CLOUDFLARE_TUNNEL_TOKEN" \
+        >"$LOG_DIR/cloudflared.log" \
+        2>"$LOG_DIR/cloudflared.err.log" &
+      echo $! >"$CF_PID_FILE"
+      disown || true
+      echo "cloudflared started (pid $(cat "$CF_PID_FILE"))"
+    fi
+  fi
+
+  echo "local: http://127.0.0.1:$LLM_PORT"
+}
+
+cmd_down() {
+  stop_pid "$CF_PID_FILE" cloudflared
+  stop_pid "$LLAMA_PID_FILE" llama-server
+}
+
+cmd_status() {
+  if pid_alive "$LLAMA_PID_FILE"; then
+    echo "llama-server: running (pid $(cat "$LLAMA_PID_FILE"))"
+  else
+    echo "llama-server: stopped"
+  fi
+  if pid_alive "$CF_PID_FILE"; then
+    echo "cloudflared:  running (pid $(cat "$CF_PID_FILE"))"
+  elif [ -n "${CLOUDFLARE_TUNNEL_TOKEN:-}" ]; then
+    echo "cloudflared:  stopped (token set in config.env)"
+  else
+    echo "cloudflared:  off (no token in config.env)"
+  fi
+
+  if command -v curl >/dev/null 2>&1; then
+    if curl -fsS --max-time 2 "http://127.0.0.1:$LLM_PORT/health" >/dev/null 2>&1 \
+       || curl -fsS --max-time 2 "http://127.0.0.1:$LLM_PORT/" >/dev/null 2>&1; then
+      echo "http:         responding on 127.0.0.1:$LLM_PORT"
+    else
+      echo "http:         not responding on 127.0.0.1:$LLM_PORT"
+    fi
+  fi
+
+  echo "url:    http://127.0.0.1:$LLM_PORT"
+  echo "model:  $LLM_MODEL"
+  echo "logs:   $LOG_DIR"
+}
+
+case "${1:-}" in
+  up)     cmd_up ;;
+  down)   cmd_down ;;
+  status) cmd_status ;;
+  *)
+    echo "usage: ./llm up | down | status"
+    echo "see README.md"
+    [ "${1:-}" = "" ] || exit 2
+    ;;
+esac
